@@ -1,0 +1,42 @@
+# Local machine configuration
+Directory.Build.local.props
+local.props
+.env
+.env.*
+!.env.example
+
+# Local tool caches
+.dotnet_cli/
+.tools/
+
+# .NET
+bin/
+obj/
+
+# Godot
+.godot/
+
+# IDE
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+
+# Generated output
+.builds/
+publish/
+packages/
+/android/
+dist/
+release/
+artifacts/
+
+# Logs and temporary files
+*.log
+tmp/
+temp/
+
+# Operating system files
+.DS_Store
+Thumbs.db

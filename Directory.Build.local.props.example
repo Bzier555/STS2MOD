@@ -1,0 +1,11 @@
+<Project>
+  <!--
+    Copy this file to Directory.Build.local.props only if template path discovery
+    does not cover your machine. The copied file is intentionally gitignored.
+  -->
+  <PropertyGroup>
+    <Sts2Path>C:\Path\To\Steam\steamapps\common\Slay the Spire 2</Sts2Path>
+    <GodotPath>C:\Path\To\MegaDot\MegaDot_v4.5.1-stable_mono_win64.exe</GodotPath>
+  </PropertyGroup>
+</Project>
+

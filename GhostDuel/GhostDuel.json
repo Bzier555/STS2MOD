@@ -1,0 +1,12 @@
+{
+  "id": "GhostDuel",
+  "name": "Ghost Duel",
+  "author": "Bzier",
+  "description": "Fight an AI-piloted Ghost of a previous run's build - a real enemy-side Player using your own cards and relics. Includes Legacy Ascension (a shared solo ladder) and an in-testing multiplayer mode where each human's own Ghost joins one combined party fight.",
+  "version": "v0.11.0-beta1",
+  "min_game_version": "0.107.1",
+  "has_pck": false,
+  "has_dll": true,
+  "dependencies": [],
+  "affects_gameplay": true
+}

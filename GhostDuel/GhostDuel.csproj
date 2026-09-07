@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <Import Project=".\Sts2PathDiscovery.props" />
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>GhostDuel</AssemblyName>
+    <RootNamespace>GhostDuel</RootNamespace>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591;MSB3270</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup Condition="Exists('$(Sts2DataDir)')">
+    <Reference Include="0Harmony">
+      <HintPath>$(Sts2DataDir)\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="GodotSharp">
+      <HintPath>$(Sts2DataDir)\GodotSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="sts2">
+      <HintPath>$(Sts2DataDir)\sts2.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="GhostDuel.json" CopyToOutputDirectory="PreserveNewest" />
+    <Compile Remove="verification\**\*.cs" />
+  </ItemGroup>
+
+  <Target Name="CheckDependencyPaths" BeforeTargets="ResolveReferences">
+    <Error Text="Slay the Spire 2 data was not found at '$(Sts2DataDir)'. Set Sts2Path on the command line if needed."
+           Condition="'$(Sts2DataDir)' == '' or !Exists('$(Sts2DataDir)')" />
+  </Target>
+
+  <!-- Copies the built mod straight into the game's mods folder for local testing. -->
+  <Target Name="DeployToModsFolder" AfterTargets="Build" Condition="Exists('$(ModsPath)')">
+    <ItemGroup>
+      <DeployFiles Include="$(OutDir)GhostDuel.dll" />
+      <DeployFiles Include="$(OutDir)GhostDuel.json" />
+    </ItemGroup>
+    <Copy SourceFiles="@(DeployFiles)" DestinationFolder="$(ModsPath)GhostDuel\" SkipUnchangedFiles="true" />
+  </Target>
+</Project>

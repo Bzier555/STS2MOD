@@ -1,0 +1,17 @@
+{
+  "id": "EnchantedRewards",
+  "name": "Enchanted Rewards",
+  "author": "Bzier",
+  "description": "Normal fights offer an enchantment for a card in your deck instead of a new card. Only Elites and Bosses still offer new cards.",
+  "version": "v0.1.0",
+  "min_game_version": "0.107.1",
+  "has_pck": false,
+  "has_dll": true,
+  "dependencies": [
+    {
+      "id": "BaseLib",
+      "min_version": "3.4.5"
+    }
+  ],
+  "affects_gameplay": true
+}

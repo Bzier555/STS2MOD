@@ -10,6 +10,7 @@ across projects.
 | --- | --- |
 | [`GhostDuel/`](GhostDuel/) | Fight an AI-piloted Ghost of a previous run's build — a real enemy-side `Player` using your own cards and relics. Pure C#/Harmony mod, no Godot project/PCK. Start with [`GhostDuel/PLAN.md`](GhostDuel/PLAN.md). |
 | [`UnstableHexTest/`](UnstableHexTest/) | A collaborative content-mod prototype adding `Unstable Hex`, a colorless card. Built on Alchyr's Slay the Spire 2 Godot template (has its own `project.godot`, PCK, and localization). Start with [`UnstableHexTest/README.md`](UnstableHexTest/README.md). |
+| [`EnchantedRewards/`](EnchantedRewards/) | A custom-run modifier: Monster fights offer an enchantment for a card already in the deck instead of a new card, Elites drop their bonus relic, and cards can carry unlimited stacking enchantments. Pure C#/Harmony mod, no Godot project/PCK. Start with [`EnchantedRewards/README.md`](EnchantedRewards/README.md). |
 
 ## Working in this repo
 

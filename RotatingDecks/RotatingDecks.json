@@ -1,0 +1,17 @@
+{
+  "id": "RotatingDecks",
+  "name": "Rotating Decks",
+  "author": "Bzier",
+  "description": "Permanently passes every player's deck to the next player at the start of each combat.",
+  "version": "v0.1.0",
+  "min_game_version": "0.107.1",
+  "has_pck": false,
+  "has_dll": true,
+  "dependencies": [
+    {
+      "id": "BaseLib",
+      "min_version": "3.4.5"
+    }
+  ],
+  "affects_gameplay": true
+}

@@ -22,13 +22,10 @@ namespace EnchantedRewards;
 /// normal path is for a combat card to have its own directly-registered clones by the time anything
 /// asks.
 ///
-/// KNOWN LIMITATION: this is in-memory only (a plain ConditionalWeakTable) and does not currently
-/// survive a save/quit and reload - extra enchantments persist for the rest of the current play
-/// session, but a card's slot-1 enchantment is all that's left after reloading a save. Making this
-/// persistent needs BaseLib's SavedSpireField/ExtendedSaveTypes custom-type registration (see
-/// EnchantedRewards_STS2_Mod_Spec.md Part 1.4 and Phase 4); deferred until the in-memory behavior is
-/// confirmed correct, since getting that JSON type registration wrong would be a much harder bug to
-/// diagnose than "extra enchantments are session-only for now".
+/// This table itself is in-memory only (a plain ConditionalWeakTable) - it does not, on its own,
+/// survive a save/quit and reload. ExtraEnchantmentSave hooks into BaseLib's extended-save mechanism
+/// to snapshot/restore it alongside each CardModel's own save data, so this limitation no longer
+/// applies in practice - see that class's own doc comment.
 /// </summary>
 internal static class ExtraEnchantments
 {
@@ -81,6 +78,20 @@ internal static class ExtraEnchantments
     }
 
     /// <summary>
+    /// Used by EnchantPreviewPatch to reorder a preview clone's flags (move whatever was temporarily
+    /// added as a stand-in for the card's *former* native enchantment back out of the extras list, once
+    /// it's been restored to the clone's actual native slot) - not needed by the normal gameplay path,
+    /// where an extra is never removed once added.
+    /// </summary>
+    public static void Remove(CardModel card, EnchantmentModel enchantment)
+    {
+        if (Table.TryGetValue(card, out List<EnchantmentModel>? list))
+        {
+            list.Remove(enchantment);
+        }
+    }
+
+    /// <summary>
     /// Finds the enchantment of the given type already on this card, whether it's the card's slot-1
     /// Enchantment or one of its extras. Null if the card doesn't have this type at all.
     /// </summary>
@@ -101,9 +112,28 @@ internal static class ExtraEnchantments
     /// AfterAutoPrePlayPhaseEntered, ...) calls into them exactly as if they were a native
     /// (slot-1) enchantment. Mirrors how CombatState.IterateHookListeners() itself walks
     /// player.PlayerCombatState.AllPiles for the native single-slot case.
+    ///
+    /// Deliberately builds and returns a fully-materialized List, not a lazy `yield return` iterator
+    /// (an earlier version was exactly that, and it's what caused a genuine crash/hang: the caller,
+    /// Hook.*'s dispatch loop, awaits each listener's own handler before pulling the next one from
+    /// this enumerable - so with a lazy iterator, this method's own enumeration of
+    /// player.PlayerCombatState.AllCards and Get(card)'s live backing list would still be
+    /// "in progress", paused mid-foreach, while a listener's handler ran. A card enchanted with
+    /// Imbued (auto-plays itself at combat start) triggers exactly that: its AfterAutoPrePlayPhaseEntered
+    /// handler moves the card between piles (and, in one confirmed case, also carried SoulsPower and
+    /// Goopy - each independently touching the very state this iterator was mid-walk over), and
+    /// .NET's collection-modified-during-enumeration check then threw `InvalidOperationException`
+    /// straight out of this method's own enumerator - which, thrown from deep inside
+    /// CombatManager.StartTurn's async chain, faulted the turn-start task and left the player unable
+    /// to act at all ("game hung", confirmed from the exception's own stack trace in the game log).
+    /// Building the whole list eagerly and synchronously, before any listener's handler runs at all,
+    /// makes the set of listeners for this hook dispatch pass a stable snapshot, immune to whatever
+    /// any of them do afterward.
     /// </summary>
     public static IEnumerable<AbstractModel> AllListenersIn(CombatState combatState)
     {
+        List<AbstractModel> listeners = new();
+
         foreach (Player player in combatState.Players)
         {
             if (player.PlayerCombatState == null)
@@ -111,13 +141,12 @@ internal static class ExtraEnchantments
                 continue;
             }
 
-            foreach (CardModel card in player.PlayerCombatState.AllCards)
+            foreach (CardModel card in player.PlayerCombatState.AllCards.ToList())
             {
-                foreach (EnchantmentModel extra in Get(card))
-                {
-                    yield return extra;
-                }
+                listeners.AddRange(Get(card));
             }
         }
+
+        return listeners;
     }
 }

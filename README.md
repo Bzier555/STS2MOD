@@ -9,7 +9,6 @@ across projects.
 | Project | What it is |
 | --- | --- |
 | [`GhostDuel/`](GhostDuel/) | Fight an AI-piloted Ghost of a previous run's build — a real enemy-side `Player` using your own cards and relics. Pure C#/Harmony mod, no Godot project/PCK. Start with [`GhostDuel/PLAN.md`](GhostDuel/PLAN.md). |
-| [`UnstableHexTest/`](UnstableHexTest/) | A collaborative content-mod prototype adding `Unstable Hex`, a colorless card. Built on Alchyr's Slay the Spire 2 Godot template (has its own `project.godot`, PCK, and localization). Start with [`UnstableHexTest/README.md`](UnstableHexTest/README.md). |
 | [`EnchantedRewards/`](EnchantedRewards/) | A custom-run modifier: Monster fights offer an enchantment for a card already in the deck instead of a new card, Elites drop their bonus relic, and cards can carry unlimited stacking enchantments. Pure C#/Harmony mod, no Godot project/PCK. Start with [`EnchantedRewards/README.md`](EnchantedRewards/README.md). |
 | [`NeowRelicsMod/`](NeowRelicsMod/) | A custom-run modifier, "Neow's Blessing": restores Neow's usual relic/curse blessing choice in Custom and Daily runs (vanilla skips it once any run modifier is active), on top of whatever other modifiers are picked. Pure C#/Harmony mod via BaseLib's `CustomModifierModel`, no Godot project/PCK. Start with [`NeowRelicsMod/README.md`](NeowRelicsMod/README.md). |
 

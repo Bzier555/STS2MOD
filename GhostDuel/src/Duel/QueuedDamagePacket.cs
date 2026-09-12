@@ -10,17 +10,25 @@ namespace GhostDuel.Duel;
 /// by full reads of <c>CreatureCmd.Damage</c>/<c>Hook.ModifyDamage</c>/<c>WeakPower.cs</c>
 /// (ENGINE-NOTES.md M3 section): <see cref="LockedAmount"/> is computed once, at card-play time, via
 /// the same <c>Hook.ModifyDamage</c> the engine itself uses for real resolution — while
-/// <see cref="GhostWeakSuppressionScope"/> and <see cref="GhostStrengthSuppressionScope"/> are both
-/// active, so neither Weak's nor Strength's own contribution is ever folded in at all. Everything
-/// else (Vulnerable, relics, other powers) is captured honestly as of that moment, matching
-/// "Vulnerable captured in card-effect order" (§5) exactly — Vulnerable is a property of the
+/// <see cref="GhostWeakSuppressionScope"/>, <see cref="GhostStrengthSuppressionScope"/>,
+/// <see cref="GhostGuardedSuppressionScope"/> and <see cref="GhostTankSuppressionScope"/> are all
+/// active, so none of Weak's, Strength's, Guarded's or Tank's own contribution is ever folded in at
+/// all. Everything else (Vulnerable, relics, other powers) is captured honestly as of that moment,
+/// matching "Vulnerable captured in card-effect order" (§5) exactly — Vulnerable is a property of the
 /// *target*, correctly frozen at the moment the dealer committed. <see cref="DisplayAmount"/> re-reads
-/// the dealer's *current* Weak and Strength directly off their own power instances and folds them in
-/// fresh every time — never divides/subtracts a stored value to "recover" a pre-modifier base
-/// (POSTMORTEM F14). Generalized 2026-09-04 (user request) from Weak-only to also cover Strength: both
-/// are dealer-side (unlike Vulnerable), so a Strength change on the dealer between queueing and
-/// resolution — e.g. Mangle's temporary loss — must affect an already-queued packet the same way Weak
-/// does, or it can only ever hit cards not yet played, one turn later than intended.
+/// the dealer's *current* Weak and Strength, and the target's *current* Guarded and Tank, directly off
+/// their own power instances and folds them in fresh every time — never divides/subtracts a stored
+/// value to "recover" a pre-modifier base (POSTMORTEM F14). Generalized 2026-09-04 (user request) from
+/// Weak-only to also cover Strength: both are dealer-side (unlike Vulnerable), so a Strength change on
+/// the dealer between queueing and resolution — e.g. Mangle's temporary loss — must affect an
+/// already-queued packet the same way Weak does, or it can only ever hit cards not yet played, one
+/// turn later than intended. Generalized again 2026-09-07 (user report: "playing tank does not update
+/// incoming damage indicators properly") to also cover Guarded/Tank: both are target-side, like
+/// Vulnerable, but unlike Vulnerable they exist specifically to be played *reactively* against an
+/// already-visible queued threat (<c>Tank</c>/<c>GuardedPower</c> are the one <c>MultiplayerOnly</c>
+/// card pair in the pool built around exactly that use case) — locking them at queue time like
+/// Vulnerable would mean they can never affect the attack they were played in response to, defeating
+/// the card's entire purpose in this delayed-queue duel.
 /// </summary>
 internal sealed class QueuedDamagePacket
 {
@@ -50,18 +58,23 @@ internal sealed class QueuedDamagePacket
     }
 
     /// <summary>What this packet would deal right now: <see cref="LockedAmount"/> (which already
-    /// excludes both Weak and Strength) plus the dealer's *live* Strength additive contribution scaled
-    /// by the target's *locked* Vulnerable multiplier, all then scaled by the dealer's *live* Weak
-    /// multiplier — matching <c>Hook.ModifyDamageInternal</c>'s own additive-then-multiplicative order.
-    /// Used for both intent display and the actual amount applied at resolution, so the two can never
-    /// disagree.</summary>
+    /// excludes Weak, Strength, Guarded and Tank) plus the dealer's *live* Strength additive
+    /// contribution scaled by the target's *locked* Vulnerable multiplier, all then scaled by the
+    /// dealer's *live* Weak multiplier and the target's *live* Guarded/Tank multiplier — matching
+    /// <c>Hook.ModifyDamageInternal</c>'s own additive-then-multiplicative order (confirmed by reading
+    /// it directly: the multiplicative pass is a plain running product across every hook listener,
+    /// <c>num *= num3</c>, so combining a third live multiplicative factor here the same way the second
+    /// already was is exactly what a fresh computation would produce). Used for both intent display and
+    /// the actual amount applied at resolution, so the two can never disagree.</summary>
     public decimal DisplayAmount
     {
         get
         {
             decimal liveStrengthAdditive = Dealer.GetPower<StrengthPower>()?.ModifyDamageAdditive(Target, 0m, Props, Dealer, CardSource) ?? 0m;
             decimal weakFactor = Dealer.GetPower<WeakPower>()?.ModifyDamageMultiplicative(Target, 1m, Props, Dealer, CardSource) ?? 1m;
-            return (LockedAmount + liveStrengthAdditive * LockedVulnerableMultiplier) * weakFactor;
+            decimal guardedFactor = Target.GetPower<GuardedPower>()?.ModifyDamageMultiplicative(Target, 1m, Props, Dealer, CardSource) ?? 1m;
+            decimal tankFactor = Target.GetPower<TankPower>()?.ModifyDamageMultiplicative(Target, 1m, Props, Dealer, CardSource) ?? 1m;
+            return (LockedAmount + liveStrengthAdditive * LockedVulnerableMultiplier) * weakFactor * guardedFactor * tankFactor;
         }
     }
 }

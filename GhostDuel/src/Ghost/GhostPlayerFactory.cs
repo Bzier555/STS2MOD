@@ -7,6 +7,7 @@ using MegaCrit.Sts2.Core.Commands;
 using MegaCrit.Sts2.Core.Entities.Cards;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Models;
+using MegaCrit.Sts2.Core.Rooms;
 using MegaCrit.Sts2.Core.Runs;
 using MegaCrit.Sts2.Core.Saves.Runs;
 using MegaCrit.Sts2.Core.Unlocks;
@@ -122,6 +123,36 @@ internal static class GhostPlayerFactory
         {
             RelicModel canonical = ModelDb.GetById<RelicModel>(ModelDb.GetId(relicType));
             await RelicCmd.Obtain(canonical.ToMutable(), ghostPlayer);
+        }
+    }
+
+    /// <summary>
+    /// 2026-09-08 (user request: make sure a Ghost's own room-entry relics, e.g. Vajra, don't get
+    /// silently skipped or break A1's first turn). Confirmed by reading <c>CombatRoom.cs:228</c>
+    /// (<c>await Hook.AfterRoomEntered(runState, this)</c>, fired once when the Ghost-fight's own
+    /// <c>CombatRoom</c> is entered) and <c>Hook.AfterRoomEntered</c> -&gt;
+    /// <c>RunState.IterateHookListeners(null)</c> (<c>RunState.cs:545-570</c>): the native dispatch
+    /// iterates <c>runState.Players</c> only — real humans, by this mod's whole design (ARCHITECTURE.md)
+    /// never including a Ghost — so a Ghost's own copy of a relic overriding <c>AfterRoomEntered</c>
+    /// (confirmed by reading every <c>AbstractModel</c> subclass that overrides it: only
+    /// <c>RelicModel</c> implementations exist — <c>Vajra</c>, <c>BronzeScales</c>, <c>DivineRight</c>,
+    /// <c>Gorget</c>, <c>Girya</c>, etc. — no card or potion currently does) would otherwise never fire
+    /// at all for a Ghost, silently. Vajra specifically applies +1 Strength "on entering a CombatRoom" —
+    /// without this, a Ghost carrying it would fight its whole match one Strength short of what its own
+    /// build should have, forever; not a crash, but a silent content gap this mod's premise forbids.
+    /// Deliberately narrow — fires directly on each Ghost's own non-melted relics for the one room that
+    /// matters (the fight itself), rather than patching <c>RunState.Players</c>/<c>IterateHookListeners</c>
+    /// (both read constantly elsewhere for things this fix must never touch, per CLAUDE.md's "narrower
+    /// call site" preference already applied identically to P37/<c>LegionOfBone</c>).
+    /// </summary>
+    public static async Task FireAfterRoomEnteredForGhosts(IEnumerable<GhostPartyMember> party, AbstractRoom room)
+    {
+        foreach (GhostPartyMember member in party)
+        {
+            foreach (RelicModel relic in member.Player.Relics.Where(r => !r.IsMelted).ToList())
+            {
+                await relic.AfterRoomEntered(room);
+            }
         }
     }
 }

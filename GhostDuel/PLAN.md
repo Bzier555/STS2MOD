@@ -1188,6 +1188,682 @@ New directory this milestone gates open: `src/Ui/`.
 
 ---
 
+## Multiplayer live-test bug batch (2026-09-07)
+
+Five reports from the same round of live multiplayer testing (four bugs, one feature request), handled
+in this order: two fixed with source-grounded confidence, one UI request rebuilt rather than patched,
+two left as diagnostics-only because neither could be root-caused from source alone.
+
+**Fixed — Ghost AI randomness now uses the game's own seeded RNG.** `WeightedRandomGhostChooser` and
+`LeftToRightChooser` drew every random decision (which power to play, Attack-vs-Skill weighting, jitter,
+target selection) from `Random.Shared` — a per-process, wall-clock-seeded source that does not survive a
+disconnect/process-restart of the same fight with the same results, per the user's explicit request that
+Ghost AI randomness "be linked to seed state like everything else in the game." Confirmed by reading
+`RunRngSet.cs`: `RunRngSet.MonsterAi` (`RunState.Rng.MonsterAi`) is the engine's own counter-based, seeded
+stream specifically documented as "what moves each monster makes whenever there's randomness involved" —
+already carried through save/reload and multiplayer sync like every other native RNG-driven decision, no
+new tracking needed. Every `Random.Shared` call site in both choosers now draws from
+`view.GhostPlayer.RunState.Rng.MonsterAi` instead. Does not change the two choosers' own determinism note
+about client-side execution (still host-only, per M9e) — this is orthogonal: it's about the *same
+process* producing the same continuation of "randomness" across a restart, not about cross-client
+agreement (which was already handled by host-authoritative broadcast). Not yet confirmed live.
+
+**Fixed — Tank/Guarded now affect an already-queued attack.** User report: "playing tank does not update
+incoming damage indicators properly." Confirmed by reading `GuardedPower.cs`/`TankPower.cs` (both
+`MultiplayerOnly` content, per `Tank.cs`): both are target-side `ModifyDamageMultiplicative` hooks, like
+Vulnerable — but unlike Vulnerable (deliberately locked at queue time, COMBAT-RULES.md §5, since it
+represents the *dealer's* own committed setup), Guarded/Tank exist specifically to be played *reactively*
+by a teammate/self against an already-visible queued threat. Locking them at queue time like Vulnerable
+meant they could never affect the attack they were played in response to — the card's entire purpose in
+this delayed-queue duel. Generalized the existing Weak/Strength "suppress at queue time, re-read live at
+display/resolution" pattern (P15/P28) to these two, target-side hooks this time: new
+`GhostGuardedSuppressionScope`/`GhostTankSuppressionScope` (`src/Duel/`), new `P35`/`P36`
+(`EnginePatches.cs`) suppressing each power's `ModifyDamageMultiplicative` while its scope is active,
+both entered alongside the existing Weak/Strength scopes in P17's queue-time `Hook.ModifyDamage` call.
+`QueuedDamagePacket.DisplayAmount` now also multiplies in the target's live Guarded and Tank factors —
+confirmed correct by reading `Hook.ModifyDamageInternal` directly: the multiplicative pass is a plain
+running product across every hook listener (`num *= num3`), so combining a third live multiplicative
+factor the same way the second (Weak) already was is exactly what a fresh computation would produce.
+P34's indicator-refresh gate extended from `WeakPower or StrengthPower` to also include `GuardedPower or
+TankPower`, so applying either one now correctly nudges the presenter to re-render. Not yet confirmed
+live.
+
+**Rebuilt, not patched — Compendium ascension selector.** Two reports from the same screenshot: (1) "the
+compendium screen does not allow for changing which ascension ghost is being viewed," with an explicit
+request for "an ascension selector similar to what happens before a run starts," and (2) the screenshot
+itself showed neither the header text nor the prev/next arrows rendering — only the deck/relic panels
+and back button were visible. Root cause of (2) not independently re-confirmed live (no fresh log from
+that session), but the prime suspect by inspection: the header label and both arrows shared one
+`HBoxContainer`, and `NRunHistoryArrowButton` is exactly the class of native, pre-`_Ready()`,
+reparented-from-a-throwaway-source widget that had already cost `GhostLedgerScreen` nine separate
+debugging passes (M10a, above) — sizing/positioning not valid until its own layout pass runs. Rather than
+risk a tenth pass on the same bug class, or gamble on reusing the real native `NAscensionPanel` (its
+packed-scene resource path is not confirmed from the decompiled source alone, and it is normally only
+ever instantiated as a character-select-screen child, not standalone), replaced the prev/next arrow pair
+entirely with a row of plain, code-constructed `Button`s — one per saved (ladder, level), built once at
+construction — the same proven-safe construction technique `GhostDeckViewerPresenter` already uses
+successfully elsewhere in this mod. Directly satisfies "jump to any level, see them all at a glance,"
+closer to the real ascension panel's own spirit than a one-at-a-time prev/next pair, while sidestepping
+the "native widget not yet ready" bug class altogether. The header label also moved onto its own
+dedicated full-width row (previously squeezed beside the two arrows) in case the missing text was a
+clipping symptom rather than a rendering failure — cannot be fully distinguished from source reading
+alone. Not yet confirmed live.
+
+**Diagnostics only — two bugs not root-caused.** Per this file's own evidence discipline (R1: never
+assert engine behavior from memory; a plausible story is not a finding), neither of these got a code fix
+this session — only targeted logging, so the next reproduction can actually answer the question instead
+of needing another guess:
+
+- *"Multiplayer combat works correctly for one turn, then end turn button does not work to progress the
+  fight."* Read `GhostActionSync.cs`, `GhostTurnController.cs`, and P32/P33 (`EnginePatches.cs`, the
+  Ghost-goes-first turn-order patches) in full looking for anything gated to fire correctly once but not
+  on a repeat — found nothing: P32/P33 are both deliberately scoped to the *first* Ghost-opening-turn
+  transition only (`RoundNumber == 1`), not a recurring per-turn hook, and `GhostActionSync`'s per-Ghost
+  channel (fixed 2026-09-05 for exactly this "works once, then hangs" shape) has no per-round reset logic
+  that could regress the same way. No further hypothesis was strong enough to act on without a log — the
+  existing log points (`GHOST-BROADCAST`/`GHOST-EXECUTE`/`TURN-START`/`TURN-END`, P33's own
+  snapshot/restore lines) should already show exactly where the second turn stalls; what's needed next is
+  the actual `ghostduel.log`/`godot.log` from a reproduction, not another guessed patch.
+- *"In Ascension 1 fight the ghosts appear to have base decks"* (user's own hypothesis: "might be a
+  problem relating to starting and ending a run on a different computer"). Read the full save → report →
+  build chain (`GhostSnapshotFileStore.Save`, `MultiplayerGhostLadderCoordinator.BuildOwnSnapshotReport`/
+  `RecordSnapshotReport`, `MultiplayerLegacyAscensionGhostFightSplice.BuildGhost`) — the "no previous
+  Ghost" case is confirmed to log loudly and refuse to build a party (never silently substitutes a fresh
+  stock deck, per PROGRESSION.md §3), so a genuinely base-looking deck must mean the *loaded* snapshot
+  itself has one, not a silent fallback — but nothing read pins down whether that traces to the save
+  (the file itself), the report (host/client mismatch), or a currently-unread step. Added deck/relic
+  counts to three existing log points that were previously missing them entirely
+  (`GhostSnapshotFileStore.Save`'s own line, `SnapshotSent`/`SnapshotReceived` in
+  `MultiplayerGhostLadderCoordinator.cs`) plus a new one right before `CreateGhostFromSnapshot` is called
+  in the splice — so the next test's log shows the count at all four points (saved → sent → received →
+  built) and can localize exactly where it drops to 10.
+
+**Fixed — a joining client never got its own `ghostduel.log`.** User question: "this should have debug
+logs for host and joiners?" Confirmed by reading every `GhostLog.OpenLogFile()` call site: all of them
+(`MultiplayerLegacyAscensionEntry.Start`, `MultiplayerDebugGhostDuelEntry.Start`, and the singleplayer
+entries) sit behind a host-only or singleplayer-only button — a joining client never called any of them,
+so it never had a dedicated log file; its `[GhostDuel]`-prefixed lines only ever reached the much noisier
+native `godot.log` (still real, since `Log.Info`/`Warn`/`Error` fire unconditionally — just not isolated).
+Fixed by opening the log file from `Postfix_ReportLadderOnClientInit` (`MultiplayerLegacyAscensionEntry.cs`)
+— already fires for every joining client on every multiplayer character-select entry regardless of which
+host mode was picked, so this covers a joining client for both multiplayer Ghost modes (Legacy Ascension
+and the plain debug fight) without a second patch. Both bugs above need exactly this to make progress —
+the end-turn hang was reported from the joining client's side, and the base-deck bug's new logging is
+only useful if the client that reports/builds the affected Ghost actually has a log file to check.
+
+---
+
+## Regression: the RNG-determinism fix broke every multiplayer Ghost fight (2026-09-07)
+
+A same-day live two-client test, using the build with the "AI randomness linked to seed state" fix
+above, failed the A0 Ghost fight immediately after the Ghost's first turn ended — the human's turn never
+usably started. Root-caused conclusively from the host's own `godot.log`, not guessed:
+
+`[ERROR] State divergence detected! Checksum with ID 96 for client ... doesn't match host's! Context:
+After enemy turn end.` — the native multiplayer consistency checker disconnected the client the instant
+the Ghost's own turn-end checksum was computed. The log dumps both the host's ("LOCAL STATE DUMP") and
+the client's ("REMOTE STATE DUMP") full state at the moment of divergence; a byte-for-byte diff of the
+two found exactly one difference in the entire dump: `RNG counter MonsterAi: 39` (host) vs. `RNG counter
+MonsterAi: 0` (client). Reproduced identically on a second attempt in the same session (different
+checksum ID, same context, same single differing field).
+
+Cause: `RunRngSet`'s per-stream counters (`RunState.Rng`) are part of the state every peer's checksum
+must agree on — correct for *native* monster AI, whose decisions run identically and independently on
+every peer as part of the ordinary lockstep simulation. But M9e's Ghost design is host-authoritative:
+only the host ever calls a chooser's `Choose()`; every other client only replays the broadcast card/
+target via `GhostActionSync.AwaitNext` and draws no randomness at all. Pointing the Ghost AI at
+`RunState.Rng.MonsterAi` (this same day's earlier fix) meant only the host's copy of that shared,
+checksummed counter ever advanced — guaranteeing a mismatch the moment a Ghost's turn involved any
+random draw. `Random.Shared` (what it replaced) never had this problem only because it isn't tracked or
+checksummed by anything.
+
+Fixed by giving the Ghost AI its own standalone stream instead of a shared one: `GhostSession.AiRng`, a
+plain `Rng(seed, name)` (confirmed via `Rng.cs` to be self-contained, registered in no `RunRngSet`
+dictionary, and therefore invisible to the checksum) seeded from the run's own stable seed
+(`RunState.Rng.Seed`) and owned by the session for the combat's lifetime. Both choosers
+(`WeightedRandomGhostChooser`, `LeftToRightChooser`) now draw from `GhostSession.Current!.AiRng` instead.
+This still delivers the reproducible-per-run half of the original request; the one honestly-stated gap
+is that this counter isn't saved/restored across a full process restart the way checksummed streams are,
+so a mid-fight disconnect that keeps the session alive continues the same sequence, but a full restart
+reseeds from the run seed and starts over — a smaller, explicitly-documented regression versus the
+multiplayer-breaking bug it replaces.
+
+Plausibly explains the *original* "multiplayer combat works for one turn, then end turn does not work"
+report from earlier the same day (before this RNG change existed) — the observed symptom (combat
+apparently freezing right as the human's turn should start) is exactly what a checksum-divergence
+disconnect looks like from the player's seat. Not asserted as confirmed, since that earlier report has
+no matching log to check against; only this session's own reproduction is confirmed root-caused. Worth
+specifically watching whether the end-turn symptom recurs on the next test now that this fix is in.
+
+Not yet re-confirmed live — needs the same two-client A0 test repeated with this build.
+
+**Important deployment note discovered while investigating**: the AiRng fix build above never actually
+reached this machine's live `mods/GhostDuel/` folder before the next test — the game was running and
+had the DLL file-locked when the build ran, the copy step failed, and the user's report of "seemingly
+the same bug" turned out to be the *same unfixed build* still running, not a failure of the fix itself.
+Confirmed by comparing file timestamps (`mods/GhostDuel/GhostDuel.dll` predated the fix; `godot.log` had
+rotated several times since with no corresponding rebuild). Re-deployed successfully once the game was
+closed. Lesson: always verify the mods-folder DLL's own timestamp/build after a deploy that reported a
+locked-file warning, rather than assuming a later `dotnet build` silently succeeded.
+
+---
+
+## Legion of Bone summons an Osty for the Ghost too (2026-09-07)
+
+User report: "legion of bones summoned osty's for the ghosts instead of only players." Confirmed by
+reading `LegionOfBone.cs` (a `MultiplayerOnly` Necrobinder card, `TargetType.AllAllies`): its own
+`OnPlay` computes its target set as `CombatState.PlayerCreatures.Where(c => c.IsAlive)` — every
+`IsPlayer`-backed creature in the whole encounter, regardless of side — then summons an Osty for each
+one via `OstyCmd.Summon`. Correct in vanilla co-op multiplayer, where no enemy is ever `Player`-backed;
+wrong the instant a real `Player` sits on `CombatSide.Enemy` (this mod's entire premise). Exactly the
+"`IsPlayer`-derived collection quietly means 'real human' until a Ghost exists" bug class already fixed
+in several native code paths (P8-P14/P22/P25, ENGINE-NOTES.md §7 Q2) — just not yet found inside a
+*card's own* logic.
+
+Confirmed via a full read of every other `Cards`/`Relics`/`Powers` source file that `LegionOfBone` is
+the *only* content item in the game using `.PlayerCreatures` directly for ally semantics — `TankPower
+.AfterApplied` (the other "bless my allies" effect, checked for comparison) already uses the correct
+side-relative `CombatState.GetTeammatesOf(Creature)` (`GetCreaturesOnSide(creature.Side)`). So this is a
+genuine, isolated inconsistency in one native method, not a systemic pattern — a single targeted patch is
+the right scope, not a broader rule change.
+
+Per CLAUDE.md's Harmony-patch question 3 ("could a narrower target work — a specific call site instead
+of a property getter"): `CombatState.PlayerCreatures` itself is one of the hot properties CLAUDE.md
+explicitly forbids postfixing to reallocate, and changing its global meaning would also break this mod's
+own correct uses of it elsewhere (both choosers' `AnyEnemy` target resolution relies on it including the
+Ghost). Fixed instead with P37 (`EnginePatches.cs`): a prefix on `LegionOfBone.OnPlay` itself, replacing
+its whole body only while a Ghost session is active — identical native calls (`CreatureCmd.TriggerAnim`,
+`OstyCmd.Summon` per ally, the same `DynamicVars.Summon` amount) with the one substitution,
+`GetTeammatesOf(owner)` (filtered to `IsPlayer` allies, matching `PlayerCreatures`' own original filter —
+a teammate's own already-summoned Osty pet sitting on the same side doesn't get double-counted) in place
+of the raw `PlayerCreatures` list. Not a content reimplementation: the effect itself (summon an Osty per
+ally) is untouched; only which creatures count as "ally" is corrected, using the same helper the base
+game's own equivalent effect already uses correctly.
+
+Not yet confirmed live.
+
+---
+
+## Four fixes from a live A0 win + upcoming-A1 review (2026-09-08)
+
+Same-day session: the previous night's AiRng fix held — a full multiplayer A0 fight completed cleanly
+this time (`ghostduel.log`: both Ghosts played real turns, no state divergence, `partyWon=True`,
+`ghost_a0.json` written with a real 32-card/23-relic Ironclad build). Four requests followed, aimed at
+the *next* fight (A1) rather than a fresh crash in this one.
+
+**Fixed — a client's `AwaitNext` could hang forever, with no log to confirm the exact trigger.** User
+report: "the game engine was waiting for the ghost [Silent] to end its turn on the player's turn."
+Checked every available log on this (host) machine for the actual incident — none showed it; the only
+Ghost fight captured tonight won cleanly with no gap. Rather than invent a specific trigger with no
+evidence, read `GhostActionSync.AwaitNext` end to end and found a real, general defect regardless of
+cause: it awaited its per-Ghost channel with **no timeout at all**, and `GhostTurnController`'s 30-second
+`TurnBudget` guard never actually bounds it — that guard is only re-checked *between* loop iterations,
+never around one in-progress `await`. Native `CombatManager.ExecuteEnemyTurn` awaits `Creature.TakeTurn()`
+(P2's target) one creature at a time, so a client stuck here never locally finishes "the Ghost's turn"
+even once every other peer has moved on to the human's — matching the report exactly. The most likely
+trigger is a missed broadcast (a dropped packet, or a client reconnecting mid-Ghost-turn with no way to
+receive whatever was already broadcast before it reconnected — M9f's own reconnect handling is
+explicitly diagnostic-only and doesn't replay history), but the fix doesn't depend on which one actually
+happened: `AwaitNext` now takes the caller's own remaining turn-budget window as an explicit timeout and
+gives up gracefully (logs, ends the Ghost's turn locally) rather than hanging forever, since a missed
+broadcast can never arrive no matter how long the wait continues.
+
+**Checked — the saved multiplayer ghost JSON.** `ghostduel_legacy_ascension_multiplayer/ghost_a0.json`
+from tonight's win: structurally valid, 32 cards / 23 relics, `current_hp`/`max_hp` both 92 (a real
+12-HP run-long gain over Ironclad's stock 80), all card/relic ids resolve. No errors found.
+
+**Fixed — Ghosts weren't healed to full before a fight, only real humans were.** Confirmed by reading
+`Player.FromSerializable`/`Player.cs:316,409-410`: a restored Ghost's `Creature.MaxHp`/`CurrentHp` are
+already set directly from the snapshot's own saved values (e.g. 92, not Ironclad's stock 80) — that part
+was already correct. But neither splice ever *healed* the Ghost — only the real humans, via a loop that
+already existed. A Ghost's snapshot can legitimately have `CurrentHp < MaxHp` (the human who earned it
+may have won their own Act-3 boss fight while still damaged), so without this the revived Ghost would
+start its own fight partway hurt. Added the identical heal-to-full loop for every `GhostPartyMember`
+in both `MultiplayerLegacyAscensionGhostFightSplice.cs` and `LegacyAscensionGhostFightSplice.cs`,
+reading each Ghost's own live `Creature.MaxHp` — never `CharacterModel.StartingHp`, which would have
+silently downgraded an earned max-HP increase back to the base character's stock value (exactly the
+failure mode the user was worried about).
+
+**Fixed — a Ghost's own room-entry relics (Vajra, confirmed picked up in tonight's run) never fired.**
+Confirmed by reading `CombatRoom.cs:228` (`await Hook.AfterRoomEntered(runState, this)`, fired once when
+the Ghost-fight's own `CombatRoom` is entered) and `Hook.AfterRoomEntered` → `RunState
+.IterateHookListeners(null)` (`RunState.cs:545-570`): the native dispatch iterates `runState.Players`
+only — real humans, by this mod's entire design never including a Ghost — so a Ghost's own copy of any
+relic overriding `AfterRoomEntered` (confirmed by reading every `AbstractModel` subclass that does: only
+`RelicModel`s — Vajra, BronzeScales, DivineRight, Gorget, Girya, and others; no card or potion currently
+does) would silently never fire. Vajra specifically grants +1 Strength on entering a `CombatRoom` — not
+a crash, but a Ghost carrying it would otherwise fight its whole match one Strength short of its own
+build, forever. New `GhostPlayerFactory.FireAfterRoomEnteredForGhosts` fires each Ghost's own non-melted
+relics against the fight's real `CombatRoom` instance right after both splices' `EnterRoom` call — a
+narrow, call-site-specific fix (per CLAUDE.md's Harmony-patch question 3, applied here even though this
+isn't a Harmony patch) rather than touching `RunState.Players`/`IterateHookListeners` themselves, both
+read constantly elsewhere for things this fix must never affect.
+
+All four not yet confirmed live — need the next A1 attempt (ideally one where a human wins their own
+Act-3 fight while damaged, and where a Ghost's build includes Vajra, to actually exercise the last two).
+
+---
+
+## A joining client stranded on "Waiting for other players..." (2026-09-08)
+
+Live A1 attempt, same day: the host correctly transitioned into the Ghost-party fight (Ghost turns
+played out normally per `ghostduel.log`), but the joining friend's screen never left the old boss-fight
+background — stuck on the native "Waiting for other players..." overlay. The host couldn't end their own
+turn, most likely because native multiplayer synchronization was waiting on the stranded peer.
+
+Root-caused **without needing a log from either machine** — a pure C# async-timing defect, confirmable
+from reading native source alone. `ActChangeSynchronizer.MoveToNextAct()` (the real "all players voted to
+advance" handler, entirely untouched by this mod, and confirmed to run independently and identically on
+every peer once the replicated vote action lands) does exactly this:
+
+```csharp
+TaskHelper.RunSafely(RunManager.Instance.EnterNextAct());
+if (NOverlayStack.Instance?.Peek() is NRewardsScreen nRewardsScreen)
+    nRewardsScreen.HideWaitingForPlayersScreen();
+```
+
+`EnterNextAct()` is called *without being awaited*. Since an `async Task` method runs synchronously up to
+its first real `await` before yielding control back to its caller, and this mod's Harmony prefix replaces
+`EnterNextAct`'s entire body, whatever our own splice does before *its* first await runs inside that same
+synchronous window — racing the native post-call check directly above. That first await used to be
+`await CreatureCmd.Heal(...)` inside the human-heal loop — but only if `missing > 0m`. A player already at
+full HP when they beat the boss skips it entirely, and execution races straight through building the
+Ghost party into `NOverlayStack.Instance?.Clear()` a few lines later — synchronously, *before* the native
+check ever runs on that peer. By the time `ActChangeSynchronizer` looks for `NRewardsScreen` at the top of
+the overlay stack, it's already gone (we cleared it), so `HideWaitingForPlayersScreen()` is silently never
+called on that one peer — while whichever peer *did* need healing naturally yielded control back first and
+got the correct behavior. A per-peer coin flip based on nothing more meaningful than "were you at full HP
+when the boss died."
+
+Fixed by adding `await Task.Yield();` as the unconditional first statement of both splices'
+`...ThenContinueUnsafe` methods (`LegacyAscensionGhostFightSplice.cs`, `MultiplayerLegacyAscensionGhostFightSplice.cs`)
+— guarantees the native caller's own post-call check always runs first, on every peer, regardless of
+anyone's HP. Applied to both the solo and multiplayer splice: the same native `ActChangeSynchronizer` path
+is used in singleplayer too (with a single always-"ready" vote), so the identical race exists there,
+just far less visible since there's no second peer left stranded — same "fix the identical gap
+identically, since nothing about it is multiplayer-specific" reasoning this project already applies
+elsewhere (see the `RecordInitialState` fix). Not yet confirmed live.
+
+---
+
+## A reconnected multiplayer run skips the Ghost fight entirely (2026-09-08)
+
+**Report**: after the `Task.Yield()` fix above, a live retest ended worse — both players landed on the
+Architect scene with no Ghost fight at all, host included. User: "this was working before, what
+changed."
+
+**Investigation**: the `Task.Yield()` fix was innocent — `ghostduel.log` (this host's dedicated file)
+had not been written to since the *previous* test session, meaning tonight's attempt never got far
+enough to even reach the splice's own logging past its very first line. `godot.log` (native, always
+written) told the real story:
+
+- `[GhostDuel] MultiplayerLegacyAscensionGhostFightSplice: final-act boss defeated ... injecting the
+  Ghost-party fight` fired correctly — the splice *did* trigger.
+- Immediately followed by `[ERROR] ... no multiplayer-ladder snapshot report received for
+  CHARACTER.IRONCLAD#76561199064564977 at A0.` — `BuildParty` (`MultiplayerLegacyAscensionGhostFightSplice.cs`)
+  found no snapshot report for either human and returned `null`, so the whole party fight was skipped
+  for everyone, falling through to the real Architect scene.
+- Zero other `[GhostDuel]` lines appear anywhere in tonight's `godot.log` before that — specifically
+  none of `MultiplayerLegacyAscensionEntry.Start`'s "starting multiplayer Ghost-ascension host flow,"
+  `Prefix_TagMultiplayerLegacyAscensionRun`'s "tagged multiplayer run," or either `LADDER-REPORT`/
+  `SNAPSHOT-SENT` line. None of `MultiplayerLegacyAscensionEntry`'s own code ran this process at all.
+- The join handshake at the top of tonight's log used `ClientLoadJoinRequestMessage`/
+  `ClientLoadJoinResponseMessage` — the *resume-an-existing-run* path — not
+  `ClientLobbyJoinRequestMessage` (fresh lobby/character-select join). This confirms the user's own
+  account: they restarted the lobby (to work around the earlier stranded-overlay bug) and reconnected
+  into the *already-embarked* A1 run rather than hosting/joining fresh through character select.
+- Confirmed locally: `ghostduel_legacy_ascension_multiplayer/ghost_a0.json` exists on this machine
+  (Ironclad, saved 2026-09-08T22:53:58Z) — the local snapshot file this human needs was there the whole
+  time. The failure is purely in the *reporting* handshake, not the underlying data.
+
+**Root cause**: `MultiplayerLegacyAscensionEntry._coordinator`/`_armed` are process-local static state,
+populated only by Harmony postfixes on `NCharacterSelectScreen.InitializeMultiplayerAsHost`/
+`InitializeMultiplayerAsClient` and consumed by `Prefix_TagMultiplayerLegacyAscensionRun`
+(`RunState.CreateForNewRun`). None of that runs when a client reconnects into an already-embarked run —
+`RunState.Modifiers` (loaded straight from the save) still carries the tagged
+`MultiplayerLegacyAscensionModifier`, so the splice itself still fires correctly, but the coordinator
+that's supposed to hold every human's previous-Ghost snapshot report was simply never built this
+process, so `BuildGhost`'s lookup always misses.
+
+**Fix**: `MultiplayerLegacyAscensionEntry.EnsureSnapshotReportsAsync` — if `_coordinator` is still
+`null` when the splice needs it (the reconnect case), attach one now against `RunManager.Instance
+.NetService` (confirmed in `ENGINE-NOTES.md`'s M9 research as the correct instance once a run actually
+exists) and re-run this human's own `ReportOwnSnapshot`, then wait up to 8 seconds (polling every
+200ms) for every human in the run to have a recorded report before proceeding. On the normal fresh-lobby
+path this is a no-op — the coordinator already exists and already reported minutes earlier at embark
+time — so nothing changes for the case that already worked. `BuildParty`/`BuildGhost` now take the
+coordinator as an explicit parameter (returned by the ensure-call) instead of re-reading the static
+`MultiplayerLegacyAscensionEntry.Coordinator` field, so there's no window where the two could
+disagree. The `Task.Yield()` fix from the section above is unaffected and kept — it addresses a
+different, later point in the same method and never got exercised by tonight's failure. Not yet
+confirmed live.
+
+---
+
+## The joining client's own snapshot report never recorded itself (2026-09-08)
+
+**Report**: next retest, a genuinely fresh lobby this time (not a reconnect) — host entered the Ghost
+party fight normally, but the joining client landed on the Architect scene instead. Not the reconnect
+gap above: this was a first attempt, arm/report flow all fired correctly.
+
+**Investigation**: the host's own `ghostduel.log` told the whole story on its own —
+`LADDER-REPORT`/arm-query-reply/`tagged multiplayer run` all fired normally, then both
+`SNAPSHOT-RECV from=<host>` and `SNAPSHOT-RECV from=<client>` landed a full 11 minutes before the Act-3
+boss died. `BuildGhost` on the host successfully built *both* party members and combat started clean —
+the coordinator had every report it needed, on the host. The failure had to be specific to the client's
+own process.
+
+**Root cause**: `MultiplayerGhostLadderCoordinator.ReportOwnSnapshot` — the host branch always called
+`RecordSnapshotReport(_net.NetId, report)` before broadcasting (recording its own report locally,
+explicitly, because "a report the host originates locally never goes through [the incoming-relay]
+path"), but the non-host (client) branch only ever called `_net.SendMessage(report)`, with no matching
+local record. `ShouldBroadcast` only relays a message that arrives *from* a peer to *other* peers —
+never back to the sender — so a joining client's own report about itself never loops back into that
+client's own `ReportedSnapshots` dictionary. `BuildGhost` runs independently on every peer's own
+process and needs an entry for every human, including that peer's own local human — so the client's
+lookup for itself failed every single time, deterministically, while the host (who always self-records)
+never had the problem. This was a latent, pre-existing gap in `ReportOwnSnapshot`, not something
+introduced by either fix above — it just never got a clean shot to surface until both earlier bugs (the
+stranded overlay, the "no fight for anyone" reconnect gap) stopped masking it.
+
+**Fix**: `ReportOwnSnapshot` now calls `RecordSnapshotReport(_net.NetId, report)` unconditionally,
+before broadcasting, regardless of host or client — collapsing what were two identical `SendMessage`
+branches into one. Not yet confirmed live.
+
+---
+
+## Compendium redesign: mode toggle, ascension badges, ghostly background (2026-09-12)
+
+**Request**: two screenshots — the current Compendium page (a flat "A0 A1 A2 A3 A4 MP A0" selector row
+mixing both ladders) and the real pre-run ascension picker's per-level flame/number display — asking
+for a Single Player / Multiplayer mode button, an ascension-level selector closer to that real picker
+(without its flavor-text tooltip), and a greyed-out/ghostly background image of the character being
+viewed.
+
+**Research pass first** (`src/Ui/GhostLedgerScreen.cs` already has a nine-pass debugging history in
+this exact file from reparenting native widgets before their own `_Ready()` runs — worth checking what
+already exists before designing new UI):
+
+1. The real `NAscensionPanel` flame icon's texture resource could not be found. Its node path
+   (`%AscensionIcon`, `NAscensionPanel.cs:238`) and `h`/`v` shader-tint mechanism are confirmed (this
+   mod's own `LegacyAscensionUiAccess` already reflects into it), but the actual image is authored in
+   that panel's `.tscn` scene file — the decompiled source tree is C# only, no scenes. Reparenting the
+   whole native panel standalone was already declined in the prior "ascension selector" revision for
+   the same reason (untested outside its normal character-select-child context); this pass didn't
+   reopen that gamble.
+2. The desaturated/"ghostly" look already exists twice in this mod, confirmed working live:
+   `EnginePatches.ApplyGrayscale` (the in-combat Ghost creature) and
+   `GhostDeckViewerPresenter.CreateDesaturatedMaterial` (a plain `Control`) — both duplicate the
+   engine's shared `res://materials/vfx/hsv.tres` material and zero its `"s"` shader parameter.
+3. `CharacterModel.CharacterSelectIcon` (decompiled `CharacterModel.cs:150-152`) is a public
+   `CompressedTexture2D` — a full character-art render keyed by character id — directly usable as a
+   `TextureRect.Texture`, no new resource-loading code needed.
+
+**Built**: `GhostLedgerScreen` now has a Single Player / Multiplayer mode toggle (two plain `Button`s,
+`ToggleMode`) that switches which ladder's ascension badges show below it — replacing the old single
+flat "both ladders mashed into one row" selector. Each level is a rounded, purple-tinted badge
+(`Color.FromHsv(0.78, ...)`, the same hue `LegacyAscensionEntry`/`MultiplayerLegacyAscensionEntry`
+already use for this mod's ascension theming) reading "A{level}", brighter with a gold border when
+selected — a deliberate look-alike for the real flame icon, not a reuse of it, since that texture isn't
+reachable (see finding 1). A full-screen `TextureRect` background shows the currently-viewed character's
+`CharacterSelectIcon`, desaturated via the exact proven `hsv.tres`/`"s"=0` technique from finding 2, at
+low alpha with a cool tint so foreground panels stay legible — added as this screen's first child
+(before `root` and the back button) so it can never win a click hit-test, consistent with this file's
+own hard-won "ninth pass" lesson about sibling draw/click order.
+
+Built clean, deployed to the local mods folder. Not yet confirmed live — needs a real Compendium-opened
+test after a full game restart.
+
+**Live feedback, same day** (first real screenshot of the above): (1) background "way too zoomed in" —
+`StretchMode = KeepAspectCovered` crops the character art to cover this screen's full-window rect, and a
+portrait-oriented render covering a wide window crops down to an unrecognizable slice. Changed to
+`KeepAspectCentered` (fits the whole image, letterboxed, never cropped). (2) "the background is a semi
+transparent overlay from another image" — the low-alpha `TextureRect` had no opaque backing of its own,
+so it was blending with whatever this screen's native parent already renders behind it, reading as two
+images double-exposed. Fixed by adding a solid dark `ColorRect` behind the character texture (same child
+position, before `root`/the back button) so the art only ever blends with a flat known color. (3) "I'd
+really like the arrow and flame selector style instead of button" — replaced the per-level button row
+with a single flame-badge-and-arrows selector (prev/next `Button`s either side of one purple badge
+showing the current level), closer to the real ascension picker's step-one-at-a-time interaction than a
+row listing every level at once. Built clean, deployed. Not yet confirmed live.
+
+**Live feedback, next session**: a screenshot of the real character-select screen (Ironclad, full red
+scene with a dragon silhouette) clarified the ask — that big scene-filling art, not the small square
+roster-icon `CharacterSelectIcon` this screen had been showing (correctly identified by the user as "the
+small images in the little buttons at the bottom" — that texture genuinely is the roster-icon asset, not
+background art). Research pass confirmed `CharacterModel.CharacterSelectBg` (decompiled
+`CharacterModel.cs:148`) is a **scene** path, not a texture — decompiled `NCharacterSelectScreen.cs:
+817-826` shows the real screen consuming it via
+`PreloadManager.Cache.GetScene(path).Instantiate<Control>(PackedScene.GenEditState.Disabled)`, added
+into a dedicated `Control` container, with the previous occupant `RemoveChildSafely`/`QueueFreeSafely`'d
+first — no `Initialize(...)` call or external signal wiring afterward. The two concrete bg-root scripts
+found in decompiled source (`NCharacterSelectScreenBg`, `NRegentCharacterSelectBg`) depend only on their
+own children/`GetTree().Root`, never on `NCharacterSelectScreen` specifically — a materially different,
+lower-risk profile than `NAscensionPanel` (which needs an external `Initialize(mode)` call this mod has
+twice now declined to gamble on). `GhostLedgerScreen.UpdateBackground` reproduces that exact native
+sequence, applying the same desaturation/tint from the previous revision to the instantiated scene's own
+root (Godot's `CanvasItem.Material`/`Modulate` inheritance cascades to whatever art nodes are actually
+inside, without needing to know that hierarchy) and wrapping the whole thing in try/catch since no
+per-character scene beyond those two scripts has been individually verified. Built clean, deployed. Not
+yet confirmed live.
+
+**Live feedback, next request**: (1) "make it opaque and greyscale ... ghost like" — the background's
+low-alpha cool-tinted `Modulate` was muddying the desaturation rather than reading as clean grayscale.
+Set to fully opaque neutral white (`Color(1,1,1,1)`), letting the existing zeroed-saturation shader alone
+carry the "ghostly" read — the same way the in-combat Ghost creature itself is opaque grayscale, not
+translucent. (2) "the ascension selector should be an exact copy of the ui from the run start menu" — a
+materially bigger ask than the background-scene reuse above. Two further research passes (per this file's
+own standing caution against reusing native widgets) established: the real `NAscensionPanel`'s arrow
+clicks (`DecrementAscension`/`IncrementAscension` → `SetAscensionLevel`) mutate only the panel's own
+local `Ascension` property and fire a public `AscensionLevelChanged` C# event — genuinely safe to
+redirect to this screen's own level index, no coupling to any live `StartRunLobby`/`RunState`. But the
+panel has no standalone packed scene of its own (unlike the background) — all 4 of its real host screens
+only ever pull it from their own pre-baked scene by unique name (`%AscensionPanel`). Presented this
+tradeoff to the user directly (materially higher risk than the background reuse) rather than deciding
+unilaterally; user chose to proceed. `NMultiplayerLoadGameScreen` identified as the lightest-weight of
+the 4 host screens (no character-button generation, no controller-manager signal hookups, no
+exported-scene-field dependencies) — sourced via its own `Create()` factory, exactly mirroring how this
+file already sources `BackButton`/`%DeckHistory`/`%RelicHistory` from a throwaway `NRunHistory`.
+`Initialize(...)` deliberately never called (confirmed unnecessary for the arrow-click wiring, which
+happens in the panel's own `_Ready()`; `Initialize` only sets an initial level/max, tints the icon, and
+for Host/Singleplayer pushes two global hotkey bindings this read-only screen has no use for) —
+`SetMaxAscension`/`SetAscensionLevel` instead kept in sync with this screen's own `_level` every
+`Refresh()`, safe specifically because `Refresh()` only ever runs after `OnSubmenuOpened()`, by which
+point the whole reparented subtree has already entered the live tree and had its own `_Ready()` run.
+`Cleanup()` called defensively on `_ExitTree()` (confirmed safe/idempotent even though `Initialize` was
+never called). The description sub-label is hidden (shows the real game's own canonical Ascension-N
+flavor text, unrelated to and actively misleading for this screen's own saved-ladder levels), and the
+icon is tinted with this mod's own established purple hue via the existing `LegacyAscensionUiAccess`
+reflection helper, for visual consistency with the rest of this mod's Ghost-Ascension UI. Built clean,
+deployed. Not yet confirmed live — this is the least-precedented reuse in this file's history and the
+one most worth watching closely on the next real test.
+
+**Live feedback, confirming both risky pieces at once**: a screenshot of a real A2 Defect run showed the
+ascension panel rendering and looking correct (confirming the reparented-`NAscensionPanel` gamble paid
+off) — but two problems. (1) The background (a lightning-effect Defect scene) rendered in full,
+undesaturated color, not grayscale at all. Root cause: the previous revision's own doc comment claiming
+"`CanvasItem.Material`/`Modulate` inheritance cascades down to children" was simply wrong —
+`Modulate` does cascade in Godot, `Material` does not; setting `Material` only on the instantiated
+scene's *root* `Control` never touched whatever texture/sprite nodes actually draw inside it. This mod
+already had the correct fix for exactly this problem, just not applied here:
+`EnginePatches.ApplyGrayscale` walks every `SpineSprite` descendant of the in-combat Ghost creature and
+gives each one its own material directly, rather than assuming inheritance. `ApplyDesaturationRecursively`
+reproduces that same walk generically (every `CanvasItem` descendant, since this background scene's
+internal node types aren't known without a `.tscn`) rather than one specific native type. (2) "the
+ascension selector ... needs to be moved into a better more central and lower location" — it had been
+squeezed into a thin `HBoxContainer` row sharing space with the header/mode buttons, and a panel built
+for a full character-select screen didn't fit there, rendering cramped and partly clipped (visible in the
+screenshot as a single stray arrow near the top-left rather than the whole widget). Pulled out of `root`'s
+document flow entirely into its own `CenterContainer` overlay, anchored to a fixed band of the screen
+(62%-92% down) independent of how much deck/relic content sits above it, added after `root`/the back
+button in child order for the same click-priority reason the back button itself already relies on. Built
+clean, deployed. Not yet confirmed live.
+
+**Live feedback, four bugs from one test (2026-09-13)**: screenshots across A0-A4 (solo) showed the
+ascension panel rendering and paging correctly, confirming that gamble sound — but exposed real
+regressions in everything touched since.
+
+1. **Back button stopped responding.** Root cause: the new full-width ascension overlay (anchored
+   62%-92% down, spanning the *entire* width) covered the same screen region the back button actually
+   lives in (bottom-left), and — added *after* the back button — won every hit-test there, exactly the
+   "later sibling wins hit-testing" lesson this file already learned twice before (the "fourth"/"ninth"
+   passes), reintroduced by this session's own change. `MouseFilter.Pass` did not save it:  that filter
+   only bubbles an unhandled event up to the control's own *parent*, not sideways to an earlier sibling
+   drawn underneath — a genuine misunderstanding, now corrected in the code's own comment. Fixed by
+   reordering the overlay *before* the back button (restoring the back button as the true topmost
+   element) and, defensively, insetting the overlay's anchors well clear of that corner on both axes.
+
+2. **Ascension panel invisible on the multiplayer tab.** Root cause: decompiled `NAscensionPanel
+   .SetMaxAscension` does `base.Visible = maxAscension > 0` natively — with zero or one multiplayer
+   snapshot saved, `SetMaxAscension(0)` hides the *whole panel*, not just its arrows. This mod already
+   has a Harmony postfix for this exact native behavior (`LegacyAscensionEntry
+   .Postfix_KeepPanelVisibleAtZero`), but it's gated behind that class's own `_armed` static field, never
+   true in this screen's read-only browsing flow — so the existing fix never applied to this reparented
+   instance. Fixed with the same one-line correction, applied locally after every `SetMaxAscension` call
+   in this screen's own `Refresh()`.
+
+3. **Background still not desaturated, and new glitches** — some backgrounds (a Defect scene) showed
+   hard-edged overlapping geometric shapes and what looked like unrelated art bleeding through. Root
+   cause: the previous revision's fix (walk every descendant, overwrite its `Material` directly) was
+   actively harmful, not just occasionally ineffective — some descendant nodes already carry their own
+   materials for legitimate masking/compositing/hover-skin effects (`NRegentCharacterSelectBg`'s own doc
+   comment already flagged a hover-skin-swap mechanism), and overwriting those broke the composition
+   rather than tinting it; other characters likely use `MegaSprite`/Spine art, where the correct target
+   is `GetNormalMaterial`/`SetNormalMaterial`, not the plain `CanvasItem.Material` the walk assumed
+   everywhere. Replaced entirely: the untouched background scene now renders into an offscreen
+   `SubViewport` (nothing inside it is ever touched, so every internal material/mask/hover-effect keeps
+   working exactly as authored), and that viewport's own composited output is displayed as one flat
+   texture through a single `TextureRect`, with the desaturation material applied to only that one node —
+   a single ordinary texture is exactly the case `GhostDeckViewerPresenter.CreateDesaturatedMaterial`
+   already handles correctly elsewhere in this mod.
+
+Built clean, deployed. Not yet confirmed live — three independent, previously-unexercised code paths
+changed at once (panel visibility, background compositing, click ordering), each worth checking
+individually on the next test rather than assuming all three landed together.
+
+**Live feedback, confirming three of four fixes**: a fresh screenshot (grayscale Ironclad, mode buttons,
+back button all correct) confirmed the desaturation, visibility, and click-order fixes above all landed.
+Only the ascension panel's own position remained off. Rather than keep guessing coordinates blind, asked
+the user directly what was wrong; they pointed back at their own original reference screenshot (the real
+pre-run ascension picker) and said to match its actual layout. Measured that reference directly this
+time instead of estimating from memory: the arrow/flame/arrow row sits at roughly x=32%-67% of screen
+width (center ≈50% — genuinely screen-centered, not left-aligned under the description panel as guessed
+two revisions ago) and y=70%-77% down — level with the back/confirm buttons' own height, but safely clear
+of them horizontally since those live in the outer ~10% margins. `_ascensionOverlay`'s anchors tightened
+to `AnchorLeft=0.3, AnchorRight=0.7, AnchorTop=0.68, AnchorBottom=0.8` to match. Built clean, deployed.
+Not yet confirmed live.
+
+**Second correction, same day**: user reported no visible change. A live screenshot comparison (their own
+screenshot against the reference, both measured directly) showed the vertical read was already right
+(~75% down, matching the reference's ~73-75%) — the "no different" report was because the first
+correction's shift was real but small. The horizontal read was the actual miss: the reference image's
+*icon itself* sits at ~36% of screen width, not ~50%. That 50% figure came from centering the whole
+native row (icon + arrows + description text), but this screen hides that description box entirely (an
+earlier explicit request to drop the flavor text) — so centering the remaining, much narrower icon+arrows
+cluster on the screen's own midpoint put the icon at true center, well right of where it sits in the
+reference. Recentered `_ascensionOverlay` at that same ~36% mark instead
+(`AnchorLeft=0.16, AnchorRight=0.56`, vertical unchanged). Built clean, deployed. Not yet confirmed live.
+
+**Size mismatch, same day**: user flagged a size difference too. Measuring both screenshots directly:
+the reference's flame icon is ~4.2% of screen width; this screen's reparented panel renders at ~3.0% —
+about 70% of the reference's size. `_ascensionPanel` is the same native scene either way, so this is
+presumably an ancestor `Scale` present in whatever screen the reference was captured from that this
+screen's own unscaled hierarchy doesn't reproduce. Corrected empirically from the measured ratio
+(`AscensionPanelScale = 1.4`, i.e. `1 / 0.7`) rather than guessed, applied to `_ascensionPanel.Scale`
+after its own layout pass (same 0.6s-after-open deferral already used for the back-button correction,
+for the same reason — `Size` isn't reliable before then) with `PivotOffset` set to half its real `Size`
+first so the scale expands from its visual center rather than its top-left corner.
+
+**Leftover background box**: the same live report also flagged a semi-transparent rounded-rectangle
+background still showing where the (deliberately hidden) description text used to sit — visibly not
+centered on the now-narrower visible widget. Confirmed this cannot be part of
+`HBoxContainer/AscensionDescription` (already hidden, description text included — Godot never renders
+anything under a `Visible=false` Control) — must be a separate node with no C# field reference in
+`NAscensionPanel.cs`, hence no name discoverable from decompiled source. Rather than guess at a name
+with no evidence (this exact class of guess has already taken several rounds this session), added a
+one-time diagnostic dump of `_ascensionPanel`'s live node tree (name/type/visible/position/size, once
+per open) to `GhostLog`, mirroring this file's own "seventh pass" diagnostic-before-another-guess
+precedent for the back button. Built clean, deployed. Not yet confirmed live — next test's log will name
+the actual node so this can be fixed directly instead of guessed.
+
+**Confirmed scale/position correct, one more report**: a live screenshot confirmed the scale (1.4x) and
+recentered position (~36% horizontal) both landed correctly — icon now visibly matches the reference's
+own proportions. Two remaining items: (1) the leftover background box is still visibly off-center from
+the now-repositioned widget (expected — still waiting on the diagnostic log to name it before fixing).
+(2) New report: "don't live resize it, make it right the first time the page loads" — the 0.6s timer
+used for the scale/pivot correction (mirroring the back-button fix) let the panel visibly render at its
+native size for half a second before snapping to the corrected scale. Root cause of needing *any* delay
+was Size not being reliable until the panel's own layout pass runs — but that pass completes on the next
+idle frame, not hundreds of milliseconds later; the 0.6s figure was borrowed from the back button's own
+delay, which is really waiting on that button's separate 0.35s show *animation*, not layout. Switched
+this correction to `Callable.From(...).CallDeferred()` (next idle frame, after layout but before the
+frame is drawn) instead of a fixed timer, so the first frame the user ever sees already has the correct
+scale. Built clean, deployed. Not yet confirmed live.
+
+**Background box identified from the actual log (2026-09-13)**: rather than wait for the user to paste
+the diagnostic dump, read `godot.log` directly (already have shell access to this machine) and found the
+mystery node named plainly: a `NinePatchRect` called "Background", a sibling of `HBoxContainer` —
+`Position=(14,5) Size=(601,118)` in the panel's own local, unscaled coordinates. It backs the *original*
+icon+description card as a whole, sized for the full card width, entirely unrelated to
+`HBoxContainer/AscensionDescription` (already correctly hidden). The same dump showed `HBoxContainer`
+itself (the real icon+arrows) at `Position=(-120,-32) Size=(240,64)` — already centered exactly on the
+panel's own local origin. Resized/repositioned "Background" to match that same centered span
+(`Position=(-130,-40) Size=(260,80)`, a small margin around it) instead of guessing further.
+
+This also explained the scale/pivot correction's own indirection: `_ascensionPanel`'s root `Size` reports
+`(0,0)` unconditionally (confirmed in the same dump, taken well after layout) — never computed by any
+container, so `PivotOffset = Size / 2` was always a no-op regardless of how long it waited. It happened
+to look right only because `HBoxContainer` was already centered at local (0,0) anyway. Replaced with an
+explicit `PivotOffset = Vector2.Zero` — same value, no longer accidental, and no longer dependent on a
+`Size` that would never change — so the whole appearance setup (hide description, resize background,
+tint icon, set pivot/scale) now runs synchronously in `SetUpAscensionPanelAppearance()` with no deferral
+at all, and the now-answered diagnostic dump was removed. Also confirmed from the same data: the "number
+not perfectly centered in the flame" and "icon possibly smaller" reports are native scene values
+(`AscensionLevel` label offset `(-2,13)` inside a same-size `AscensionIcon`; native icon size 64×64,
+which at the existing 1.4× scale renders at ~90px, matching the reference's own measured ~85px) —
+neither introduced by this mod. Built clean, deployed. Not yet confirmed live.
+
+**Polish pass (2026-09-13)**: screenshot confirmed the "Background" resize landed correctly — the card
+now hugs the icon/arrows and reads as one cohesive unit. Two follow-up requests: "fix the flame
+formatting" (the tight `-10/-8`-margin hug read as cramped, icon and arrows crowding the card's own
+edges — widened to `Position=(-150,-50) Size=(300,100)` for real breathing room) and "make the single
+player and multiplayer buttons better formatted" (they were plain, unthemed default Godot `Button`s).
+Added `CreateModeButtonStyleBox`, a rounded StyleBoxFlat reusing this mod's own established
+`AscensionHue` purple (the same hue already used for the level icon's own tint and, previously, the
+now-removed look-alike badges) — darker/unfilled when unselected, brighter with a gold border when
+selected — plus real content margins and a 10px gap between the two buttons, so the pair reads as a
+deliberate themed toggle rather than two default widgets glued together. Built clean, deployed. Not yet
+confirmed live.
+
+**Flame/number overlap, same day**: a close-up screenshot showed the level number visibly overlapping
+the flame glyph's own edges rather than sitting inside it — user: "just make the flame 25% bigger and
+adjust the number field to be centered on that." Per the earlier diagnostic dump, `AscensionLevel` (the
+number) is a *child* of `AscensionIcon` (the flame), both reporting the same native 64x64 `Size`, with
+`AscensionLevel` at a slightly-off-center native `Position=(-2,13)`. Scaling `AscensionIcon` by a new
+`AscensionIconExtraScale = 1.25` (on top of the whole panel's existing 1.4x) carries the number along
+with it at the same factor since it's nested — preserves their native relative proportion, just bigger —
+while separately resetting `AscensionLevel.Position` to `Vector2.Zero` (exact overlap, given the equal
+sizes) corrects the native offset that was the actual source of the visible overlap. Built clean,
+deployed. Not yet confirmed live.
+
+**Correction, same day**: live feedback ("too high now") showed that zeroing the label's `Position` was
+itself the mistake, not the fix — the flame glyph is visually bottom-heavy (wide base, tapering to a
+point at top), so a number centered on the icon's *bounding box* sits above the flame's actual visual
+center. The native `Position=(-2,13)` offset was already the correct compensation for that asymmetry, not
+a bug — the real source of the original overlap complaint was the icon being too small relative to the
+number (already fixed by `AscensionIconExtraScale`), not this offset. Reverted to the native value.
+Built clean, deployed. Not yet confirmed live.
+
+**Second correction, same day**: the reverted native `(-2,13)` then read as "too low" — the opposite
+problem from the zeroed `(0,0)` attempt. Comparing a fresh vanilla "No Ascension" reference screenshot
+against this screen's own render, both showing the same level-0 digit, confirmed the reference sits
+close to centered within the flame's rounded body — nowhere near as low as the native offset placed it.
+Since the two tried values (`0` and `13`) bracket the correct one from opposite directions, interpolated
+roughly halfway (`y = 7`) rather than guessing a third arbitrary value. Built clean, deployed. Not yet
+confirmed live.
+
+---
+
 ## Standing quality bars
 
 Applied at every milestone, checked at every gate:

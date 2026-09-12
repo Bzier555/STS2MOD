@@ -82,19 +82,18 @@ internal sealed class MultiplayerGhostLadderCoordinator : IDisposable
     public void ReportOwnSnapshot(int lockedInLevel)
     {
         MultiplayerGhostSnapshotReportMessage report = BuildOwnSnapshotReport(lockedInLevel);
-        GhostLog.SnapshotSent(SelfLabel(), report.level, report.hasPreviousGhost);
-        if (_net.Type == NetGameType.Host)
-        {
-            // The host's own report needs its own explicit broadcast — ShouldBroadcast only
-            // auto-relays a message that arrives *from* a peer (NetHostGameService.OnPacketReceived);
-            // a report the host originates locally never goes through that path at all.
-            RecordSnapshotReport(_net.NetId, report);
-            _net.SendMessage(report);
-        }
-        else
-        {
-            _net.SendMessage(report);
-        }
+        GhostLog.SnapshotSent(SelfLabel(), report.level, report.hasPreviousGhost, report.player?.Deck.Count ?? -1, report.player?.Relics.Count ?? -1);
+        // 2026-09-08 (live incident: host entered the Ghost-party fight normally, the joining client
+        // went to the Architect scene instead — deterministic, not a timing fluke). Root cause:
+        // BuildGhost needs every human's own entry in ITS OWN process's ReportedSnapshots, including
+        // that process's own local human — but ShouldBroadcast only auto-relays a message that arrives
+        // *from* a peer (NetHostGameService.OnPacketReceived) to *other* peers, never back to the
+        // sender, so a non-host caller's own report never looped back to itself. Recording locally here
+        // unconditionally (previously host-only) fixes that; the broadcast below is still needed
+        // unconditionally too, host included, since a report this process originates locally never
+        // reaches anyone else without it.
+        RecordSnapshotReport(_net.NetId, report);
+        _net.SendMessage(report);
     }
 
     private static MultiplayerGhostSnapshotReportMessage BuildOwnSnapshotReport(int lockedInLevel)
@@ -149,7 +148,7 @@ internal sealed class MultiplayerGhostLadderCoordinator : IDisposable
     private void RecordSnapshotReport(ulong senderId, MultiplayerGhostSnapshotReportMessage message)
     {
         _reportedSnapshots[senderId] = message;
-        GhostLog.SnapshotReceived(senderId, message.level, message.hasPreviousGhost);
+        GhostLog.SnapshotReceived(senderId, message.level, message.hasPreviousGhost, message.player?.Deck.Count ?? -1, message.player?.Relics.Count ?? -1);
     }
 
     private string SelfLabel() => $"NetId#{_net.NetId}";

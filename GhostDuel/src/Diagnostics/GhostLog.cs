@@ -120,11 +120,18 @@ public static class GhostLog
     public static void LadderReport(string selfLabel, int ownMaxLevel, int? aggregateMin) =>
         Info($"LADDER-REPORT {selfLabel}: ownMax={ownMaxLevel} aggregateMin={(aggregateMin?.ToString() ?? "pending")}");
 
-    public static void SnapshotSent(string selfLabel, int level, bool hasPreviousGhost) =>
-        Info($"SNAPSHOT-SENT {selfLabel}: level={level} hasPreviousGhost={hasPreviousGhost}");
+    /// <summary>2026-09-07: deckCount/relicCount added (user report: "in Ascension 1 fight the ghosts
+    /// appear to have base decks") — without these, a "hasPreviousGhost=true" log line can't
+    /// distinguish "loaded the real winning build" from "loaded/reported something that happens to look
+    /// like a fresh 10-card starter deck," which is exactly the open question here. Read this alongside
+    /// <see cref="SnapshotReceived"/>'s own count on the *other* end of the same report to see whether a
+    /// mismatch happens in transit, or the sent count was already wrong (the file itself, or the human
+    /// identified as "me" when it was saved).</summary>
+    public static void SnapshotSent(string selfLabel, int level, bool hasPreviousGhost, int deckCount = -1, int relicCount = -1) =>
+        Info($"SNAPSHOT-SENT {selfLabel}: level={level} hasPreviousGhost={hasPreviousGhost} deckCount={deckCount} relicCount={relicCount}");
 
-    public static void SnapshotReceived(ulong senderNetId, int level, bool hasPreviousGhost) =>
-        Info($"SNAPSHOT-RECV from={senderNetId}: level={level} hasPreviousGhost={hasPreviousGhost}");
+    public static void SnapshotReceived(ulong senderNetId, int level, bool hasPreviousGhost, int deckCount = -1, int relicCount = -1) =>
+        Info($"SNAPSHOT-RECV from={senderNetId}: level={level} hasPreviousGhost={hasPreviousGhost} deckCount={deckCount} relicCount={relicCount}");
 
     public static void GhostBroadcast(uint sequenceNumber, ulong ghostNetId, string cardEntry, string? targetLabel) =>
         Info($"GHOST-BROADCAST seq={sequenceNumber} ghost={ghostNetId} card={cardEntry} target={targetLabel ?? "none"}");

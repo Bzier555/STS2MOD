@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using GhostDuel.Diagnostics;
@@ -103,10 +104,38 @@ internal sealed class GhostActionSync : IDisposable
     /// <summary>Client (non-host) only: waits for and resolves the next broadcast event for this
     /// specific Ghost against the currently-captured hand/combat state. Returns null for an end-turn
     /// event, matching <see cref="IGhostCardChooser"/>'s own "null means end turn" contract, so the
-    /// rest of <see cref="GhostTurnController"/>'s loop needs no other branching.</summary>
-    public async Task<GhostChoice?> AwaitNext(Player ghostPlayer, GhostTurnView view)
+    /// rest of <see cref="GhostTurnController"/>'s loop needs no other branching.
+    /// <b>Revised 2026-09-08</b> (user report: "the game engine was waiting for the ghost [Silent] to
+    /// end its turn on the player's turn"): this used to await the channel with no timeout at all. If a
+    /// broadcast for this Ghost is ever missed — a dropped packet, or (the most likely case, since
+    /// M9f's own reconnect handling is explicitly diagnostic-only and does not replay missed turn
+    /// events) a client reconnecting mid-Ghost-turn, with no way to receive whatever was already
+    /// broadcast before it reconnected — this awaited forever. <see cref="GhostTurnController"/>'s own
+    /// 30-second <c>TurnBudget</c> guard does not actually bound this: it is only re-checked *between*
+    /// loop iterations, never around a single in-progress await, so a hang here never trips it. Because
+    /// native <c>CombatManager.ExecuteEnemyTurn</c>'s per-creature loop awaits <c>Creature.TakeTurn()</c>
+    /// (P2's target) for one creature at a time, a client stuck here never locally finishes processing
+    /// "the Ghost's turn," even while the host and every other peer have already moved on to the human's
+    /// turn — matching the reported symptom exactly. Now takes the caller's own remaining turn-budget
+    /// window as an explicit timeout and gives up (logs and returns null, i.e. "end this Ghost's turn
+    /// locally") rather than hanging forever; a missed broadcast can never be recovered from by waiting
+    /// longer, so timing out is the only honest option (CLAUDE.md: surface what's unavailable rather
+    /// than hang pretending it will arrive).</summary>
+    public async Task<GhostChoice?> AwaitNext(Player ghostPlayer, GhostTurnView view, TimeSpan timeout)
     {
-        GhostCardPlayEvent evt = await GetOrCreateChannel(ghostPlayer.NetId).Reader.ReadAsync();
+        GhostCardPlayEvent evt;
+        using (CancellationTokenSource cts = new(timeout))
+        {
+            try
+            {
+                evt = await GetOrCreateChannel(ghostPlayer.NetId).Reader.ReadAsync(cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                GhostLog.Error($"GhostActionSync: timed out after {timeout.TotalSeconds:F0}s waiting for the host's next broadcast for ghost {ghostPlayer.NetId} — a broadcast was missed (dropped message, or a mid-turn reconnect that can't replay history) and can never arrive now; ending this Ghost's turn locally rather than hanging forever.");
+                return null;
+            }
+        }
         if (evt.isEndTurn)
         {
             return null;

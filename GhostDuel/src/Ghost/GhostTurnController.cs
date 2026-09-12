@@ -139,7 +139,17 @@ internal static class GhostTurnController
             }
             else
             {
-                choice = await session.ActionSync.AwaitNext(ghostPlayer, view);
+                // Revised 2026-09-08: pass the turn's own remaining wall-clock budget as an explicit
+                // per-await timeout — see GhostActionSync.AwaitNext's own doc comment for why the old
+                // no-timeout wait could hang forever on a single missed broadcast, immune to this loop's
+                // own TurnBudget check (which only re-runs between iterations, never around one await).
+                TimeSpan remaining = TurnBudget - clock.Elapsed;
+                if (remaining <= TimeSpan.Zero)
+                {
+                    GhostLog.Warn($"{label}: turn budget already exhausted before awaiting the next broadcast — ending turn.");
+                    break;
+                }
+                choice = await session.ActionSync.AwaitNext(ghostPlayer, view, remaining);
                 if (choice is null)
                 {
                     break;

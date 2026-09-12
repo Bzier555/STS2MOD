@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading.Tasks;
 using GhostDuel.Diagnostics;
 using GhostDuel.Ghost;
 using GhostDuel.Multiplayer.Messages;
@@ -8,6 +9,7 @@ using GhostDuel.Progression;
 using Godot;
 using HarmonyLib;
 using MegaCrit.Sts2.addons.mega_text;
+using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Entities.UI;
 using MegaCrit.Sts2.Core.Helpers;
 using MegaCrit.Sts2.Core.Models;
@@ -52,6 +54,50 @@ internal static class MultiplayerLegacyAscensionEntry
     /// potentially much later than lobby time, so the coordinator is deliberately kept alive (not
     /// disposed) past a successful embark, unlike the back-out case.</summary>
     public static MultiplayerGhostLadderCoordinator? Coordinator => _coordinator;
+
+    /// <summary>
+    /// Confirmed live 2026-09-08: a run resumed via the "load"/reconnect join path
+    /// (<c>ClientLoadJoinRequestMessage</c>, seen replacing the fresh-lobby
+    /// <c>ClientLoadJoinRequestMessage</c> in <c>godot.log</c> after the player restarted their lobby to
+    /// work around the stranded-overlay bug) never touches <c>NCharacterSelectScreen</c> at all, so
+    /// neither <see cref="Start"/> nor <see cref="Postfix_ReportLadderOnHostInit"/> /
+    /// <see cref="Postfix_ReportLadderOnClientInit"/> ever ran — <see cref="_coordinator"/> stayed
+    /// <c>null</c> for the entire process. <c>MultiplayerLegacyAscensionGhostFightSplice.BuildGhost</c>
+    /// found no coordinator at all and logged "no multiplayer-ladder snapshot report received," skipping
+    /// the whole party fight for every human — confirmed from a live log showing none of this class's own
+    /// log lines (no "starting multiplayer Ghost-ascension host flow," no "tagged multiplayer run") ever
+    /// printed that session, only the splice's own boss-defeated/error lines.
+    ///
+    /// <c>RunState.Modifiers</c> is loaded straight from the save regardless of how the run was reached,
+    /// so a live <see cref="MultiplayerLegacyAscensionModifier"/> is licence enough to (re)attach a
+    /// coordinator here and redo the same report handshake <see cref="AttachCoordinatorAndReport"/> does
+    /// at fresh-embark time — just later, and without "Acts 1-3 give plenty of time" to rely on, hence
+    /// the bounded wait for every human's report rather than firing and hoping.
+    /// </summary>
+    public static async Task<MultiplayerGhostLadderCoordinator> EnsureSnapshotReportsAsync(
+        INetGameService net, IReadOnlyList<Player> humans, int lockedInLevel, TimeSpan timeout)
+    {
+        bool freshlyAttached = _coordinator is null;
+        MultiplayerGhostLadderCoordinator coordinator = _coordinator ??= new MultiplayerGhostLadderCoordinator(net);
+        if (freshlyAttached)
+        {
+            GhostLog.Warn("MultiplayerLegacyAscensionEntry: no ladder coordinator was attached this session (this run was likely resumed/reconnected rather than freshly hosted or joined through character select) — attaching one now and re-reporting this human's own snapshot.");
+            coordinator.ReportOwnSnapshot(lockedInLevel);
+        }
+
+        DateTime deadline = DateTime.UtcNow + timeout;
+        while (humans.Any(h => !coordinator.ReportedSnapshots.ContainsKey(h.NetId)) && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(200));
+        }
+
+        IEnumerable<ulong> stillMissing = humans.Select(h => h.NetId).Where(id => !coordinator.ReportedSnapshots.ContainsKey(id));
+        if (stillMissing.Any())
+        {
+            GhostLog.Warn($"MultiplayerLegacyAscensionEntry: gave up waiting for snapshot reports from [{string.Join(", ", stillMissing)}] after {timeout.TotalSeconds}s.");
+        }
+        return coordinator;
+    }
 
     public static void Start(NMultiplayerHostSubmenu submenu)
     {
@@ -111,13 +157,26 @@ internal static class MultiplayerLegacyAscensionEntry
     /// regardless of which side of the connection they are. <b>Revised 2026-09-04</b>: <c>_armed</c>
     /// is never yet <c>true</c> on the client at this exact synchronous moment — see this class's
     /// "arm query" doc comment for why. Ask the host directly instead of assuming, and remember this
-    /// screen so <see cref="OnArmMessageReceived"/> can finish the job once the reply arrives.</summary>
+    /// screen so <see cref="OnArmMessageReceived"/> can finish the job once the reply arrives.
+    /// <b>Revised 2026-09-07</b> (user question: "this should have debug logs for host and joiners?"):
+    /// confirmed by reading every <c>GhostLog.OpenLogFile()</c> call site — all of them (this class's own
+    /// <see cref="Start"/>, <c>MultiplayerDebugGhostDuelEntry.Start</c>, the singleplayer entries) sit
+    /// behind a host-only or singleplayer-only button; a joining client never called any of them, so it
+    /// never got its own dedicated <c>ghostduel.log</c> — its <c>[GhostDuel]</c> lines only ever reached
+    /// the native, much noisier <c>godot.log</c>. This postfix already fires for every joining client on
+    /// every multiplayer character-select entry regardless of which host mode was picked (Legacy
+    /// Ascension, the plain debug fight, or neither), so opening the log file here — unconditionally,
+    /// before the arm check below — covers a joining client for both multiplayer Ghost modes for free,
+    /// symmetric with how the host-side entries also open it unconditionally.</summary>
     [HarmonyPatch(typeof(NCharacterSelectScreen), nameof(NCharacterSelectScreen.InitializeMultiplayerAsClient))]
     private static class Postfix_ReportLadderOnClientInit
     {
         [HarmonyPostfix]
         private static void Postfix(NCharacterSelectScreen __instance, ClientLobbyJoinResponseMessage message)
         {
+            GhostLog.OpenLogFile();
+            GhostLog.Info("MultiplayerLegacyAscensionEntry: joining client reached character select — opened this client's own ghostduel.log.");
+
             if (_armed)
             {
                 AttachCoordinatorAndReport(__instance);

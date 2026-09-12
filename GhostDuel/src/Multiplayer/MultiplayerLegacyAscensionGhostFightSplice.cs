@@ -84,6 +84,27 @@ internal static class MultiplayerLegacyAscensionGhostFightSplice
 
         private static async Task InjectGhostPartyFightThenContinueUnsafe(RunManager instance, RunState runState, MultiplayerLegacyAscensionModifier modifier)
         {
+            // 2026-09-08 (live incident: a joining friend's screen got stuck on "Waiting for other
+            // players..." over the old boss-fight background, while the host proceeded normally into
+            // the Ghost fight). Root cause, confirmed by reading ActChangeSynchronizer.MoveToNextAct
+            // (native, untouched by this mod — the multiplayer "everyone voted to advance" mechanism):
+            // it calls `TaskHelper.RunSafely(RunManager.Instance.EnterNextAct())` — NOT awaited — then
+            // immediately checks `NOverlayStack.Instance?.Peek() is NRewardsScreen` to decide whether to
+            // call `HideWaitingForPlayersScreen()`. An `async Task` method runs synchronously up to its
+            // first `await` before control returns to its caller, so whatever this method (reached via
+            // the Harmony prefix that replaces the real EnterNextAct) does before ITS first real await
+            // races that same native post-call check — on *each peer independently*, since
+            // OnPlayerReady/MoveToNextAct run identically on every client once the replicated vote
+            // action confirms everyone is ready. The human-heal loop below is that first await — but
+            // only if `missing > 0m`; a player already at full HP skips it entirely and races straight
+            // through to `NOverlayStack.Instance?.Clear()` further down, synchronously, *before* the
+            // native check ever runs on that peer — so it finds something other than NRewardsScreen on
+            // top and silently never dismisses the waiting overlay, stranding that one peer while
+            // whichever peer *did* need healing (and therefore already yielded control back naturally)
+            // proceeds normally. A forced yield here, unconditionally, guarantees the native caller's
+            // own post-call check always wins this race on every peer, regardless of anyone's HP.
+            await Task.Yield();
+
             IReadOnlyList<Player> humans = runState.Players;
             foreach (Player player in humans)
             {
@@ -94,7 +115,19 @@ internal static class MultiplayerLegacyAscensionGhostFightSplice
                 }
             }
 
-            List<GhostPartyMember>? party = BuildParty(modifier.LadderLevel, humans);
+            // 2026-09-08 (live incident: both players landed on the Architect scene with no fight at
+            // all). Root cause, confirmed from a log showing none of MultiplayerLegacyAscensionEntry's
+            // own arm/report lines that session: the run had been resumed via the "load"/reconnect join
+            // path (restarting the lobby after the earlier stranded-overlay bug), which never touches
+            // NCharacterSelectScreen — so the ladder coordinator was never attached and held no snapshot
+            // reports at all. See MultiplayerLegacyAscensionEntry.EnsureSnapshotReportsAsync's own doc
+            // comment for the full chain. This call is a no-op on the normal fresh-lobby path (the
+            // coordinator already exists there, reported minutes ago at embark time per
+            // Prefix_TagMultiplayerLegacyAscensionRun) and only does real work as a reconnect fallback.
+            MultiplayerGhostLadderCoordinator coordinator = await MultiplayerLegacyAscensionEntry.EnsureSnapshotReportsAsync(
+                instance.NetService, humans, modifier.LadderLevel, TimeSpan.FromSeconds(8));
+
+            List<GhostPartyMember>? party = BuildParty(modifier.LadderLevel, humans, coordinator);
             if (party is null)
             {
                 // BuildParty already logged exactly what was missing. Never substitute or guess
@@ -112,6 +145,22 @@ internal static class MultiplayerLegacyAscensionGhostFightSplice
             foreach (GhostPartyMember member in party)
             {
                 GhostPlayerFactory.JoinRun(member.Player, runState);
+                // 2026-09-08 (user request): heal every restored Ghost to full before the fight, the
+                // same courtesy already given to the real humans above — a Ghost's snapshot can
+                // legitimately have CurrentHp < MaxHp (the human who earned it may have won their own
+                // Act-3 boss fight while still damaged; only real humans got healed to full before that
+                // fight, not their own eventual Ghost). Deliberately reads Creature.MaxHp — the Ghost's
+                // own live, already-restored value (Player.FromSerializable's constructor sets it
+                // directly from the snapshot's MaxHp, confirmed by reading Player.cs — e.g. 92 for a
+                // run that grew past Ironclad's stock 80) — never CharacterModel.StartingHp, which
+                // would silently downgrade an earned max-HP increase back to the base character's stock
+                // value.
+                Creature ghostCreature = member.Player.Creature;
+                decimal ghostMissing = ghostCreature.MaxHp - ghostCreature.CurrentHp;
+                if (ghostMissing > 0m)
+                {
+                    await CreatureCmd.Heal(ghostCreature, ghostMissing);
+                }
             }
             GhostSession session = GhostSession.Begin(party);
             GhostLog.Party($"A{modifier.LadderLevel}", $"[{string.Join(", ", party.Select(m => $"{m.Player.Character.Id}#{m.Player.NetId}"))}]");
@@ -149,7 +198,13 @@ internal static class MultiplayerLegacyAscensionGhostFightSplice
                     instance.CombatReplayWriter.RecordInitialState(instance.ToSave(null));
                 }
 
-                await instance.EnterRoom(new CombatRoom(ModelDb.Encounter<GhostDuelEncounter>().ToMutable(), runState) { ShouldResumeParentEventAfterCombat = false });
+                CombatRoom ghostFightRoom = new(ModelDb.Encounter<GhostDuelEncounter>().ToMutable(), runState) { ShouldResumeParentEventAfterCombat = false };
+                await instance.EnterRoom(ghostFightRoom);
+                // See GhostPlayerFactory.FireAfterRoomEnteredForGhosts' own doc comment: the native
+                // call this same EnterRoom already made (CombatRoom.cs:228) only ever reaches the real
+                // humans' own relics (e.g. Vajra), never a Ghost's — this is the mod-side equivalent for
+                // the party.
+                await GhostPlayerFactory.FireAfterRoomEnteredForGhosts(party, ghostFightRoom);
                 if (!MegaCrit.Sts2.Core.TestSupport.TestMode.IsOn)
                 {
                     await NGame.Instance!.Transition.RoomFadeIn();
@@ -194,13 +249,13 @@ internal static class MultiplayerLegacyAscensionGhostFightSplice
         /// COMBAT-RULES.md/PROGRESSION.md's "stable saved party order" requirement for free, since
         /// this is simply <paramref name="humans"/>' own order). Returns null (after logging exactly
         /// what's missing) if any single human's Ghost cannot be built — never a partial party.</summary>
-        private static List<GhostPartyMember>? BuildParty(int ladderLevel, IReadOnlyList<Player> humans)
+        private static List<GhostPartyMember>? BuildParty(int ladderLevel, IReadOnlyList<Player> humans, MultiplayerGhostLadderCoordinator coordinator)
         {
             List<GhostPartyMember> party = new(humans.Count);
             for (int i = 0; i < humans.Count; i++)
             {
                 Player human = humans[i];
-                Player? ghost = BuildGhost(ladderLevel, human, i);
+                Player? ghost = BuildGhost(ladderLevel, human, i, coordinator);
                 if (ghost is null)
                 {
                     return null;
@@ -210,15 +265,14 @@ internal static class MultiplayerLegacyAscensionGhostFightSplice
             return party;
         }
 
-        private static Player? BuildGhost(int ladderLevel, Player human, int partyIndex)
+        private static Player? BuildGhost(int ladderLevel, Player human, int partyIndex, MultiplayerGhostLadderCoordinator coordinator)
         {
             if (ladderLevel == 0)
             {
                 return GhostPlayerFactory.CreateDebugGhost(human.Character, partyIndex);
             }
 
-            MultiplayerGhostLadderCoordinator? coordinator = MultiplayerLegacyAscensionEntry.Coordinator;
-            if (coordinator is null || !coordinator.ReportedSnapshots.TryGetValue(human.NetId, out Messages.MultiplayerGhostSnapshotReportMessage report))
+            if (!coordinator.ReportedSnapshots.TryGetValue(human.NetId, out Messages.MultiplayerGhostSnapshotReportMessage report))
             {
                 GhostLog.Error($"MultiplayerLegacyAscensionGhostFightSplice: no multiplayer-ladder snapshot report received for {human.Character.Id}#{human.NetId} at A{ladderLevel - 1}.");
                 return null;
@@ -228,6 +282,13 @@ internal static class MultiplayerLegacyAscensionGhostFightSplice
                 GhostLog.Error($"MultiplayerLegacyAscensionGhostFightSplice: {human.Character.Id}#{human.NetId} reported no previous Ghost for A{ladderLevel - 1}.");
                 return null;
             }
+            // 2026-09-07 (user report: "in Ascension 1 fight the ghosts appear to have base decks"):
+            // logs the snapshot's own deck/relic count right before it's used to build the Ghost, so a
+            // future log can distinguish "the reported snapshot was already a base deck" (root cause is
+            // upstream — the report or the save that produced it) from "the report was fine but
+            // something downstream of this line rebuilt a fresh Ghost instead" (root cause is here or
+            // later). Cross-reference against this same human's own SNAPSHOT-SENT line.
+            GhostLog.Info($"MultiplayerLegacyAscensionGhostFightSplice: building A{ladderLevel - 1} Ghost for {human.Character.Id}#{human.NetId} from reported snapshot (deckCount={snapshot.Deck.Count}, relicCount={snapshot.Relics.Count}).");
             return GhostPlayerFactory.CreateGhostFromSnapshot(snapshot, partyIndex);
         }
 

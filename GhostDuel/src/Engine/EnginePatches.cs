@@ -21,6 +21,8 @@ using MegaCrit.Sts2.Core.Entities.UI;
 using MegaCrit.Sts2.Core.GameActions.Multiplayer;
 using MegaCrit.Sts2.Core.Hooks;
 using MegaCrit.Sts2.Core.Models;
+using MegaCrit.Sts2.Core.Models.Cards;
+using MegaCrit.Sts2.Core.Models.Characters;
 using MegaCrit.Sts2.Core.Models.Powers;
 using MegaCrit.Sts2.Core.Multiplayer.Game;
 using MegaCrit.Sts2.Core.Nodes.Combat;
@@ -1140,6 +1142,8 @@ internal static class EnginePatches
                 decimal lockedAmount;
                 using (GhostWeakSuppressionScope.Enter())
                 using (GhostStrengthSuppressionScope.Enter())
+                using (GhostGuardedSuppressionScope.Enter())
+                using (GhostTankSuppressionScope.Enter())
                 {
                     lockedAmount = Hook.ModifyDamage(IRunState.GetFrom(new[] { dealer, target }), dealer.CombatState, target, dealer, amount, props, cardSource, ModifyDamageHookType.All, CardPreviewMode.None, out _);
                 }
@@ -1823,6 +1827,13 @@ internal static class EnginePatches
     /// number. Deliberately not narrowed further to "only if this creature currently has pending
     /// queued damage" — the presenter's own refresh is already a cheap no-op when nothing is queued for
     /// anyone, and this only ever runs while a Ghost Duel session is active in the first place.
+    /// <b>Revised 2026-09-07</b> (user report: "playing tank does not update incoming damage
+    /// indicators properly"): extended from <c>WeakPower or StrengthPower</c> to also include
+    /// <c>GuardedPower or TankPower</c> — both now live-read in <c>QueuedDamagePacket.DisplayAmount</c>
+    /// (see P35/P36 below), so applying either one needs the exact same "tell the presenter to
+    /// re-render" nudge, even though both apply to the *target* of a queued packet rather than the
+    /// dealer — <c>GhostDamageIndicatorPresenter</c>'s refresh re-evaluates every pending packet
+    /// regardless of which side changed, so no further narrowing is needed here.
     /// </summary>
     [HarmonyPatch(typeof(PowerModel), nameof(PowerModel.SetAmount))]
     private static class P34_RefreshQueuedDamageIndicatorOnDealerModifierChange
@@ -1830,11 +1841,126 @@ internal static class EnginePatches
         [HarmonyPostfix]
         private static void Postfix(PowerModel __instance)
         {
-            if (GhostSession.Current is null || __instance is not (WeakPower or StrengthPower))
+            if (GhostSession.Current is null || __instance is not (WeakPower or StrengthPower or GuardedPower or TankPower))
             {
                 return;
             }
             GhostSession.Current.DamageQueue.NotifyDisplayChanged();
+        }
+    }
+
+    /// <summary>
+    /// P35: generalizes P15/P28's queue-time-suppress-then-live-re-read treatment to Guarded, per the
+    /// user's 2026-09-07 report ("playing tank does not update incoming damage indicators properly").
+    /// Confirmed by reading <c>GuardedPower.cs</c>: it halves damage from a "powered attack"
+    /// (<c>props.IsPoweredAttack()</c> — true for any ordinary card/monster-move attack, confirmed via
+    /// <c>ValuePropExtensions.IsPoweredAttack</c>) landing on its own holder — a target-side hook, like
+    /// Vulnerable, but unlike Vulnerable it is meant to be played *reactively*, by a teammate, against
+    /// an already-queued/visible threat (see <see cref="GhostGuardedSuppressionScope"/>'s own doc
+    /// comment for the full reasoning on why that rules out Vulnerable's "locked at queue time"
+    /// treatment). Forces <c>GuardedPower.ModifyDamageMultiplicative</c> to return 1 while
+    /// <see cref="GhostGuardedSuppressionScope"/> is active, so P17 can compute a
+    /// <see cref="QueuedDamagePacket.LockedAmount"/> that excludes Guarded the same way it already
+    /// excludes Weak/Strength; <see cref="QueuedDamagePacket.DisplayAmount"/> re-multiplies the
+    /// target's live Guarded factor back in at display/resolution time.
+    /// </summary>
+    [HarmonyPatch(typeof(GuardedPower), nameof(GuardedPower.ModifyDamageMultiplicative))]
+    private static class P35_SuppressGuardedForLockedDamageComputation
+    {
+        [HarmonyPostfix]
+        private static void Postfix(ref decimal __result)
+        {
+            if (GhostSession.Current is null || !GhostGuardedSuppressionScope.IsActive)
+            {
+                return;
+            }
+            __result = 1m;
+        }
+    }
+
+    /// <summary>
+    /// P36: the same treatment as P35, for <c>TankPower</c>'s own self-multiplier. Confirmed by reading
+    /// <c>TankPower.cs</c>: it doubles damage from a "powered attack" landing on whoever played Tank —
+    /// also target-side, also meant to be a reactive commitment (the player accepting a real cost the
+    /// instant they see a queued attack coming, per <c>Tank</c>'s own card text), so it needs the exact
+    /// same live-at-resolution treatment as Guarded rather than Vulnerable's locked-at-queue-time one.
+    /// Kept as its own patch/scope rather than sharing P35's — see
+    /// <see cref="GhostTankSuppressionScope"/>'s own doc comment for why. Forces <c>TankPower
+    /// .ModifyDamageMultiplicative</c> to return 1 while <see cref="GhostTankSuppressionScope"/> is
+    /// active; <see cref="QueuedDamagePacket.DisplayAmount"/> re-multiplies the target's live Tank
+    /// factor back in at display/resolution time.
+    /// </summary>
+    [HarmonyPatch(typeof(TankPower), nameof(TankPower.ModifyDamageMultiplicative))]
+    private static class P36_SuppressTankForLockedDamageComputation
+    {
+        [HarmonyPostfix]
+        private static void Postfix(ref decimal __result)
+        {
+            if (GhostSession.Current is null || !GhostTankSuppressionScope.IsActive)
+            {
+                return;
+            }
+            __result = 1m;
+        }
+    }
+
+    /// <summary>
+    /// P37: user report — "legion of bones summoned osty's for the ghosts instead of only players."
+    /// Confirmed by reading <c>LegionOfBone.cs</c> (a <c>MultiplayerOnly</c> Necrobinder card,
+    /// <c>TargetType.AllAllies</c>): its own <c>OnPlay</c> computes its target set as
+    /// <c>CombatState.PlayerCreatures.Where(c => c.IsAlive)</c> — every <c>IsPlayer</c>-backed creature
+    /// in the whole encounter, regardless of side — then summons an Osty for each one. That is correct
+    /// in vanilla co-op multiplayer, where no enemy is ever <c>Player</c>-backed, but wrong the instant a
+    /// real <c>Player</c> sits on <c>CombatSide.Enemy</c> (this mod's entire premise) — exactly the
+    /// "<c>IsPlayer</c>-derived collection quietly means 'real human' until a Ghost exists" bug class
+    /// already fixed in native code paths by P8-P14/P22/P25 (ENGINE-NOTES.md §7 Q2), just not yet found
+    /// in a *card's own* logic. Confirmed by reading every other <c>Cards</c>/<c>Relics</c>/<c>Powers</c>
+    /// source file that this is the *only* content item using <c>.PlayerCreatures</c> directly for ally
+    /// semantics — <c>TankPower.AfterApplied</c>, the other "bless my allies" effect checked for
+    /// comparison, already uses the correct side-relative <c>CombatState.GetTeammatesOf(Creature)</c>
+    /// (<c>GetCreaturesOnSide(creature.Side)</c>, confirmed by reading <c>CombatState.cs</c>) — so this
+    /// is a genuine, isolated inconsistency in this one native method, not a systemic pattern needing a
+    /// broader fix. Per CLAUDE.md's Harmony-patch question 3 ("could a narrower target work — a specific
+    /// call site instead of a property getter"): yes — <c>CombatState.PlayerCreatures</c> itself is one
+    /// of the hot properties CLAUDE.md explicitly forbids postfixing to reallocate, and changing its
+    /// global meaning would also break this mod's own correct uses of it elsewhere (e.g. both choosers'
+    /// <c>AnyEnemy</c> target resolution, which relies on it including the Ghost). Prefixes
+    /// <c>LegionOfBone.OnPlay</c> itself instead, replacing its whole body only while a Ghost session is
+    /// active: identical native calls (<c>CreatureCmd.TriggerAnim</c>, <c>OstyCmd.Summon</c> per ally,
+    /// same <c>DynamicVars.Summon</c> amount) with the one substitution — <c>GetTeammatesOf(owner)</c>
+    /// instead of the raw <c>PlayerCreatures</c> list. Not a content reimplementation: the effect itself
+    /// (summon an Osty per ally) is untouched; only which creatures count as "ally" is corrected, using
+    /// the same helper the base game's own equivalent effect already uses correctly.
+    /// </summary>
+    [HarmonyPatch(typeof(LegionOfBone), "OnPlay")]
+    private static class P37_LegionOfBoneRealAlliesOnly
+    {
+        [HarmonyPrefix]
+        private static bool Prefix(LegionOfBone __instance, PlayerChoiceContext choiceContext, ref Task __result)
+        {
+            if (GhostSession.Current is null)
+            {
+                return true;
+            }
+            __result = RunUnsafe(__instance, choiceContext);
+            return false;
+        }
+
+        private static async Task RunUnsafe(LegionOfBone card, PlayerChoiceContext choiceContext)
+        {
+            Creature ownerCreature = card.Owner.Creature;
+            await CreatureCmd.TriggerAnim(ownerCreature, Necrobinder.GetSummonAnimIfApplicable(card.Owner.Character), Necrobinder.GetSummonDelayIfApplicable(card.Owner.Character));
+            // IsPlayer as well as IsAlive: GetTeammatesOf returns every creature on the side (pets
+            // included, e.g. another ally's own Osty), matching PlayerCreatures' own original
+            // Where(c => c.IsPlayer) filter — only real Player-backed allies get their own Osty.
+            List<Player> allies = (ownerCreature.CombatState?.GetTeammatesOf(ownerCreature) ?? Array.Empty<Creature>())
+                .Where(c => c.IsAlive && c.IsPlayer && c.Player is not null)
+                .Select(c => c.Player!)
+                .ToList();
+            foreach (Player ally in allies)
+            {
+                await OstyCmd.Summon(choiceContext, ally, card.DynamicVars.Summon.BaseValue, card);
+            }
         }
     }
 

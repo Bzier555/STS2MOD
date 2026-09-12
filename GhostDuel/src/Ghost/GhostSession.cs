@@ -11,6 +11,7 @@ using MegaCrit.Sts2.Core.Entities.Creatures;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Multiplayer.Game;
 using MegaCrit.Sts2.Core.Nodes.Combat;
+using MegaCrit.Sts2.Core.Random;
 using MegaCrit.Sts2.Core.Rooms;
 using MegaCrit.Sts2.Core.Runs;
 
@@ -110,6 +111,38 @@ internal sealed class GhostSession : IDisposable
     /// because a <see cref="GhostSession"/> only ever exists once a real run/combat is already active.</summary>
     public GhostActionSync ActionSync { get; }
 
+    /// <summary>
+    /// The Ghost AI's own source of randomness — deliberately <b>not</b> <c>RunState.Rng.MonsterAi</c>.
+    /// <b>2026-09-07 postmortem</b>: the first attempt at "link Ghost AI randomness to seed state"
+    /// (per the user's own request) used exactly that — <c>RunState.Rng.MonsterAi</c>, the engine's
+    /// shared, counter-based stream for monster decisions. Confirmed live from a real two-client
+    /// session's <c>godot.log</c> (`State divergence detected!`, context "After enemy turn end," a
+    /// byte-for-byte diff of the host's vs. client's dumped state showing exactly one difference: `RNG
+    /// counter MonsterAi: 39` on the host vs. `0` on the client) that this breaks multiplayer outright:
+    /// <c>RunRngSet</c>'s per-stream counters are part of the native state checksum every peer must
+    /// agree on, but M9e's host-authoritative design means only the host ever calls
+    /// <see cref="IGhostCardChooser.Choose"/> (a client only replays the broadcast card/target, via
+    /// <see cref="GhostActionSync.AwaitNext"/>, and never draws from any RNG at all) — so only the
+    /// host's copy of that shared counter ever advances, guaranteeing a checksum mismatch and a forced
+    /// disconnect the instant the Ghost's turn ends and finishes any card that consumed randomness.
+    /// This is unlike a *native* monster, whose AI decisions run identically, independently, on every
+    /// peer as part of the ordinary lockstep simulation — there is no broadcast step to skip.
+    /// Fixed by giving the Ghost AI its own standalone <c>Rng</c>
+    /// (<c>Rng(uint seed, string name)</c>, confirmed by reading <c>Rng.cs</c> to be a self-contained
+    /// stream with no registration in <c>RunRngSet</c>'s own tracked dictionary and therefore no
+    /// participation in the checksum at all) — seeded from the run's own stable seed
+    /// (<c>RunState.Rng.Seed</c>), so it is still deterministic and reproducible for a given run (the
+    /// part of the original request this can honestly deliver), just never shared with or checked
+    /// against any other peer. Owned by the session (not the chooser) so it persists across every Ghost
+    /// party member's turns for the combat's lifetime. <b>Known, stated gap</b>: unlike the
+    /// checksummed streams, this counter is not saved/restored across a full process restart — a
+    /// disconnect/reconnect that keeps this session alive continues the same sequence, but a process
+    /// restart reseeds from the same run seed and starts the counter over, which is not a perfect
+    /// "same timeline" continuation. Revisit only if that specific gap is ever reported as a problem;
+    /// it is a strictly smaller regression than the multiplayer-breaking bug it replaces.
+    /// </summary>
+    public Rng AiRng { get; }
+
     private readonly INetGameService _net;
     private bool _disposed;
 
@@ -123,6 +156,7 @@ internal sealed class GhostSession : IDisposable
         _damagePresenter = new GhostDamageIndicatorPresenter(this);
         _net = RunManager.Instance.NetService;
         ActionSync = new GhostActionSync(_net);
+        AiRng = new Rng(party[0].Player.RunState.Rng.Seed, "ghost_ai");
         _net.RegisterMessageHandler<GhostPartyResyncMessage>(OnPartyResyncReceived);
     }
 

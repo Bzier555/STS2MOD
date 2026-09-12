@@ -121,7 +121,12 @@ internal sealed class GhostSnapshotFileStore
         string tempPath = path + ".tmp";
         File.WriteAllText(tempPath, json);
         File.Move(tempPath, path, overwrite: false);
-        GhostLog.Info($"GhostSnapshotFileStore: wrote {path} (character={player.CharacterId}).");
+        // deckCount/relicCount added 2026-09-07 (user report: "in Ascension 1 fight the ghosts appear
+        // to have base decks") — this is the one save chokepoint both the solo and multiplayer splices
+        // go through, so logging the counts here answers whether a "base deck" symptom traces back to
+        // the save itself (a low count here) or to something downstream of it (a healthy count here,
+        // but a mismatched/base-looking one wherever the snapshot is later reported/loaded/built).
+        GhostLog.Info($"GhostSnapshotFileStore: wrote {path} (character={player.CharacterId}, deckCount={player.Deck.Count}, relicCount={player.Relics.Count}).");
         return true;
     }
 

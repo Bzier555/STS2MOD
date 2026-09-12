@@ -93,6 +93,23 @@ internal static class LegacyAscensionGhostFightSplice
 
         private static async Task InjectGhostFightThenContinueUnsafe(RunManager instance, RunState runState, LegacyAscensionModifier modifier)
         {
+            // 2026-09-08 (live incident: a joining client's screen got stuck on "Waiting for other
+            // players..." over the old boss-fight background). Root cause, confirmed by reading
+            // ActChangeSynchronizer.MoveToNextAct (native, untouched by this mod): it calls
+            // `TaskHelper.RunSafely(RunManager.Instance.EnterNextAct())` — NOT awaited — then
+            // immediately checks `NOverlayStack.Instance?.Peek() is NRewardsScreen` to decide whether to
+            // call `HideWaitingForPlayersScreen()`. An `async Task` method runs synchronously up to its
+            // first `await` before control returns to its caller, so whatever this method (reached via
+            // the Harmony prefix that replaces the real EnterNextAct) does before ITS first real await
+            // races that same native post-call check. The human-heal loop below is that first await —
+            // but only if `missing > 0m`; a player already at full HP skips it entirely and races
+            // straight through to `NOverlayStack.Instance?.Clear()` further down, synchronously,
+            // *before* the native check ever runs — so it finds something other than NRewardsScreen on
+            // top and silently never dismisses the waiting overlay, stranding that peer. A forced yield
+            // here, unconditionally, guarantees the native caller's own post-call check always wins this
+            // race regardless of whether anyone happens to need healing.
+            await Task.Yield();
+
             Player human = runState.Players[0];
             foreach (Player player in runState.Players)
             {
@@ -127,6 +144,19 @@ internal static class LegacyAscensionGhostFightSplice
             }
 
             GhostPlayerFactory.JoinRun(ghostPlayer, runState);
+            // 2026-09-08 (user request, mirroring the multiplayer splice's identical fix): heal the
+            // restored Ghost to full before the fight, the same courtesy already given to the real
+            // human above — its snapshot can legitimately have CurrentHp < MaxHp (the human who earned
+            // it may have won their own Act-3 boss fight while still damaged). Reads Creature.MaxHp —
+            // the Ghost's own live, already-restored value (Player.FromSerializable sets it directly
+            // from the snapshot's MaxHp, confirmed by reading Player.cs), never CharacterModel
+            // .StartingHp, which would silently downgrade an earned max-HP increase back to the base
+            // character's stock value.
+            decimal ghostMissing = ghostPlayer.Creature.MaxHp - ghostPlayer.Creature.CurrentHp;
+            if (ghostMissing > 0m)
+            {
+                await CreatureCmd.Heal(ghostPlayer.Creature, ghostMissing);
+            }
             GhostSession session = GhostSession.Begin(ghostPlayer, new WeightedRandomGhostChooser());
 
             // Mirrors EnterNextAct's own choreography for its "enter a new room" branch
@@ -171,7 +201,12 @@ internal static class LegacyAscensionGhostFightSplice
                 // to do this itself only because CreateRoom applies .ToMutable() to *its* return
                 // value regardless of source. Calling the constructor directly, as here, means doing
                 // it ourselves.
-                await instance.EnterRoom(new CombatRoom(ModelDb.Encounter<GhostDuelEncounter>().ToMutable(), runState) { ShouldResumeParentEventAfterCombat = false });
+                CombatRoom ghostFightRoom = new(ModelDb.Encounter<GhostDuelEncounter>().ToMutable(), runState) { ShouldResumeParentEventAfterCombat = false };
+                await instance.EnterRoom(ghostFightRoom);
+                // See GhostPlayerFactory.FireAfterRoomEnteredForGhosts' own doc comment: the native
+                // call this same EnterRoom already made (CombatRoom.cs:228) only ever reaches the real
+                // human's own relics (e.g. Vajra), never the Ghost's — this is the mod-side equivalent.
+                await GhostPlayerFactory.FireAfterRoomEnteredForGhosts(session.Party, ghostFightRoom);
                 if (!MegaCrit.Sts2.Core.TestSupport.TestMode.IsOn)
                 {
                     await NGame.Instance!.Transition.RoomFadeIn();

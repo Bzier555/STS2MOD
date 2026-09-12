@@ -11,6 +11,7 @@ using MegaCrit.Sts2.Core.Entities.Cards;
 using MegaCrit.Sts2.Core.Entities.Creatures;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Models;
+using MegaCrit.Sts2.Core.Random;
 
 namespace GhostDuel.Ai;
 
@@ -73,6 +74,14 @@ internal sealed class WeightedRandomGhostChooser : IGhostCardChooser
             return _fallback.Choose(view);
         }
 
+        // Revised 2026-09-07 (user request, then corrected the same day after a live multiplayer
+        // regression — see GhostSession.AiRng's own doc comment for the full incident): every random
+        // draw below comes from the session's own standalone, seeded Rng — deliberately not
+        // RunRngSet.MonsterAi, which is part of the multiplayer state checksum and broke every
+        // multiplayer Ghost fight the instant a Ghost's turn ended, confirmed live from a two-client
+        // godot.log.
+        Rng rng = GhostSession.Current!.AiRng;
+
         CardResolver cardResolver = new(CardCatalogRepository.Shared, new CardDefinitionRepository(), new RunCardStateStore(), new CombatCardStateStore());
         List<PlayableCard> playable = new();
         foreach (CardModel card in view.Hand)
@@ -81,7 +90,7 @@ internal sealed class WeightedRandomGhostChooser : IGhostCardChooser
             {
                 continue;
             }
-            Creature? target = ResolveTarget(card, combatState, ghostSide);
+            Creature? target = ResolveTarget(card, combatState, ghostSide, rng);
             if (!card.IsValidTarget(target))
             {
                 continue;
@@ -99,7 +108,7 @@ internal sealed class WeightedRandomGhostChooser : IGhostCardChooser
         List<PlayableCard> powers = playable.Where(p => p.Resolved.Type == CardType.Power).ToList();
         if (powers.Count > 0)
         {
-            return ToChoice(powers[Random.Shared.Next(powers.Count)]);
+            return ToChoice(powers[rng.NextInt(powers.Count)]);
         }
 
         // 2. Spend Energy-costing cards before 0-cost ones (§4/§5) — "no currently playable
@@ -116,16 +125,16 @@ internal sealed class WeightedRandomGhostChooser : IGhostCardChooser
             // Neither category playable in this pool (e.g. only a Curse/Status is somehow playable) —
             // no known deck instance of this; pick uniformly rather than force a category, and leave
             // the drift untouched since neither category was actually exercised.
-            return ToChoice(pool[Random.Shared.Next(pool.Count)]);
+            return ToChoice(pool[rng.NextInt(pool.Count)]);
         }
 
         // 3. Attack/Skill weighted choice (§9/§10) — a forced single-category pick still updates the
         // drift afterward, per §2's explicit "still updates as if it intentionally chose" rule.
         bool playAttack = attacks.Count > 0 && skills.Count > 0
-            ? Random.Shared.Next(100) < _attackProbability
+            ? rng.NextInt(100) < _attackProbability
             : attacks.Count > 0;
 
-        PlayableCard chosen = playAttack ? ChooseBest(attacks, ScoreAttack) : ChooseBest(skills, ScoreSkill);
+        PlayableCard chosen = playAttack ? ChooseBest(attacks, ScoreAttack, rng) : ChooseBest(skills, ScoreSkill, rng);
 
         _attackProbability = playAttack
             ? Math.Max(MinAttackProbability, _attackProbability - ProbabilityStep)
@@ -136,9 +145,9 @@ internal sealed class WeightedRandomGhostChooser : IGhostCardChooser
 
     /// <summary>§11/§12: rank by score plus a bounded jitter, so the pick is usually — not always —
     /// the top-scoring candidate.</summary>
-    private static PlayableCard ChooseBest(List<PlayableCard> candidates, Func<ResolvedCardView, int> score) =>
+    private static PlayableCard ChooseBest(List<PlayableCard> candidates, Func<ResolvedCardView, int> score, Rng rng) =>
         candidates
-            .Select(candidate => (Candidate: candidate, Jittered: score(candidate.Resolved) + Random.Shared.Next(-ScoreJitter, ScoreJitter + 1)))
+            .Select(candidate => (Candidate: candidate, Jittered: score(candidate.Resolved) + rng.NextInt(-ScoreJitter, ScoreJitter + 1)))
             .OrderByDescending(x => x.Jittered)
             .First()
             .Candidate;
@@ -166,18 +175,18 @@ internal sealed class WeightedRandomGhostChooser : IGhostCardChooser
     /// <summary>Mirrors <see cref="LeftToRightChooser"/>'s own side-relative target resolution
     /// (random among valid candidates). Determinism note (COMBAT-RULES.md §11): safe only because a
     /// chooser ever runs host-side — see that class's matching note.</summary>
-    private static Creature? ResolveTarget(CardModel card, ICombatState combatState, CombatSide ghostSide) =>
+    private static Creature? ResolveTarget(CardModel card, ICombatState combatState, CombatSide ghostSide, Rng rng) =>
         card.TargetType switch
         {
-            TargetType.AnyEnemy => PickRandom(combatState.PlayerCreatures?.Where(c => c.Side != ghostSide && c.IsAlive)),
+            TargetType.AnyEnemy => PickRandom(combatState.PlayerCreatures?.Where(c => c.Side != ghostSide && c.IsAlive), rng),
             TargetType.AnyAlly => combatState.PlayerCreatures?.FirstOrDefault(c => c.Side == ghostSide && c.IsAlive),
             _ => null,
         };
 
-    private static Creature? PickRandom(IEnumerable<Creature>? candidates)
+    private static Creature? PickRandom(IEnumerable<Creature>? candidates, Rng rng)
     {
         List<Creature>? list = candidates?.ToList();
-        return list is not { Count: > 0 } ? null : list[Random.Shared.Next(list.Count)];
+        return list is not { Count: > 0 } ? null : list[rng.NextInt(list.Count)];
     }
 
     private readonly record struct PlayableCard(CardModel Card, ResolvedCardView Resolved, Creature? Target);

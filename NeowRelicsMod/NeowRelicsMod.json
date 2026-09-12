@@ -1,0 +1,14 @@
+{
+  "id": "NeowRelicsMod",
+  "name": "Neow Relics Restored",
+  "author": "Bzier",
+  "description": "Restores Neow's usual relic/curse blessing choice in Custom and Daily runs, in addition to any run modifiers picked, just like in a standard run. Multiplayer-safe.",
+  "version": "v1.0.0",
+  "min_game_version": "0.107.1",
+  "has_pck": false,
+  "has_dll": true,
+  "dependencies": [
+    {"id": "BaseLib", "min_version": "3.4.5"}
+  ],
+  "affects_gameplay": true
+}

@@ -20,5 +20,5 @@ public sealed class NeowBlessingModifier : CustomModifierModel, ILocalizationPro
 
     public List<(string, string)> Localization => new ModifierLoc(
         "Neow's Blessing",
-        "Neow still offers her usual relic/curse choice after any other modifiers are resolved, just like a standard run.");
+        "Restores Neow's relics to Custom runs");
 }
